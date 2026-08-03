@@ -1,22 +1,24 @@
+//! Print the event name of every message that is not one of the kinds
+//! [`eddn::Message`] parses, to see what is going by unrecognised.
+
 use eddn::{subscribe, Message, URL};
 
 fn main() {
     // Without this the crate traces into the void.
     tracing_subscriber::fmt::init();
 
-    for envelop in subscribe(URL, None) {
-        if let Ok(envelop) = envelop {
-            match envelop.message {
-                Message::Other(o) => {
-                    let event = o.as_object().unwrap().get("event");
-                    if let Some(e) = event {
-                        println!("{}", e);
-                    }
-                    // else {
-                    //     dbg!(o);
-                    // }
-                }
-                _ => {}
+    for result in subscribe(URL, None) {
+        let envelope = match result {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                eprintln!("{}", err);
+                continue;
+            }
+        };
+
+        if let Message::Other(value) = envelope.message {
+            if let Some(event) = value.get("event") {
+                println!("{}", event);
             }
         }
     }
