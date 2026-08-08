@@ -1,5 +1,11 @@
-//! Print the event name of every message that is not one of the kinds
-//! [`eddn::Message`] parses, to see what is going by unrecognised.
+//! Print the `$schemaRef` of every message [`eddn::Message`] does not read,
+//! to see what is going by unread.
+//!
+//! The schema is the useful thing to name now rather than the event. A
+//! message is placed by the schema it was sent under, so a schema turning up
+//! here is exactly the work of adding it, and the ones with no `event` key at
+//! all -- outfitting, shipyard, blackmarket -- could not have been named any
+//! other way.
 
 use eddn::{subscribe, Message, URL};
 
@@ -16,10 +22,8 @@ fn main() {
             }
         };
 
-        if let Message::Other(value) = envelope.message {
-            if let Some(event) = value.get("event") {
-                println!("{}", event);
-            }
+        if let Message::Unmodeled(_) = envelope.message {
+            println!("{}", envelope.schema_ref);
         }
     }
 }
