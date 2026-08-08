@@ -19,6 +19,7 @@ pub use crate::error::Error;
 use crate::connection::{Connection, Stall};
 use crate::reporter::Reporter;
 use chrono::prelude::*;
+use elite_journal::entry::market::{BlackMarket, Outfitting, Shipyard};
 use elite_journal::entry::{Entry, Event, Market};
 use miniz_oxide::inflate;
 use serde::Deserialize;
@@ -92,6 +93,9 @@ pub struct Header {
 pub enum Message {
     Journal(Entry<Event>),
     Commodity(Entry<Market>),
+    Outfitting(Entry<Outfitting>),
+    Shipyard(Entry<Shipyard>),
+    BlackMarket(Entry<BlackMarket>),
 
     /// A live schema this crate does not read yet
     ///
@@ -149,6 +153,13 @@ impl Message {
                 Message::Journal(serde_json::from_value(message)?)
             }
             "commodity" => Message::Commodity(serde_json::from_value(message)?),
+            "outfitting" => {
+                Message::Outfitting(serde_json::from_value(message)?)
+            }
+            "shipyard" => Message::Shipyard(serde_json::from_value(message)?),
+            "blackmarket" => {
+                Message::BlackMarket(serde_json::from_value(message)?)
+            }
             _ => Message::Unmodeled(message),
         })
     }
@@ -157,10 +168,13 @@ impl Message {
 /// The schema a `$schemaRef` names, and whether it is a test schema
 ///
 /// A reference reads `https://eddn.edcd.io/schemas/<name>/<version>`, with
-/// `/test` after it where the data is not from the live game. The version is
-/// not returned: no schema has ever changed a field this crate reads without
-/// also changing its name, and outfitting sending both 2 and 3 is the whole
-/// of the evidence for that.
+/// `/test` after it where the data is not from the live game.
+///
+/// The version is not returned. Outfitting is sent under both 2 and 3 and they
+/// do differ -- 2 names a module, 3 prices it -- but that is one field of one
+/// payload, and is answered there by reading either. Handing a version back
+/// would put the question in the wrong place: every caller would have to know
+/// which versions of everything exist in order to ignore that they do.
 fn split_schema_ref(schema_ref: &str) -> Option<(&str, bool)> {
     let (_, tail) = schema_ref.split_once(SCHEMAS)?;
     let mut parts = tail.split('/');
