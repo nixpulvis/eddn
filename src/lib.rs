@@ -29,12 +29,36 @@ use tracing::{info, warn, Level};
 pub const URL: &'static str = "tcp://eddn.edcd.io:9500";
 
 /// Top level EDDN message wrapper
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct Envelope {
-    #[serde(rename = "$schemaRef")]
     pub schema_ref: String,
     pub header: Header,
     pub message: Message,
+}
+
+/// What the envelope looks like before its payload has been placed
+///
+/// The payload cannot be read until the `$schemaRef` above it has been, so
+/// it is held as JSON for exactly as long as it takes to read the rest.
+#[derive(Deserialize)]
+struct RawEnvelope {
+    #[serde(rename = "$schemaRef")]
+    schema_ref: String,
+    header: Header,
+    message: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for Envelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawEnvelope::deserialize(deserializer)?;
+        let message = Message::read(&raw.schema_ref, raw.message)
+            .map_err(serde::de::Error::custom)?;
+
+        Ok(Envelope { schema_ref: raw.schema_ref, header: raw.header, message })
+    }
 }
 
 /// Message uploader metadata
@@ -51,21 +75,101 @@ pub struct Header {
 }
 
 /// Payload of the message containing the parsed data
-#[derive(Debug, Deserialize)]
-// TODO: Don't use untagged, we need to write a custom deserialized that uses the $schemaRef.
-// NOTE: [ "Docked", "FSDJump", "Scan", "Location", "SAASignalsFound", "CarrierJump" ]
-//       https://github.com/EDCD/EDDN/blob/d9b5586a4ef5a5c4c1117ec4105b773697b468ac/schemas/journal-v1.0.json#L43
-#[serde(untagged)]
+///
+/// Which of these a message becomes is decided by the `$schemaRef` above it
+/// rather than by trying each in turn. Most of the schemas carry a journal
+/// event and so arrive as [`Message::Journal`]; what separates them is the
+/// event inside, which is what [`Event`] already dispatches on. The rest are
+/// their own shapes and get their own variants.
+///
+/// Guessing was what this did before, and there were two things it could not
+/// do. A schema whose payload has no `event` key at all — outfitting,
+/// shipyard, blackmarket — could never be told apart from any other, because
+/// the guess had nothing to go on. And a payload that failed to parse looked
+/// exactly like a payload that belonged to some other variant, so it fell
+/// quietly to the catchall instead of being reported.
+#[derive(Debug)]
 pub enum Message {
     Journal(Entry<Event>),
     Commodity(Entry<Market>),
-    // TODO
-    // Shipyard,
-    // Outfitting,
-    // Blackmarket,
 
-    // Untagged catchall, must be at the end.
-    Other(serde_json::Value),
+    /// A live schema this crate does not read yet
+    ///
+    /// Kept as JSON rather than dropped, so that what is going unread can be
+    /// seen by whoever is looking.
+    Unmodeled(serde_json::Value),
+
+    /// Anything sent under a `/test` schema
+    ///
+    /// EDDN carries alpha and beta game data on the same socket as live data,
+    /// separated only by a `/test` suffix on the `$schemaRef`. It describes a
+    /// galaxy that is not this one, so it is parted from live data here and
+    /// left for the consumer to discard.
+    Test(serde_json::Value),
+}
+
+/// Where every EDDN `$schemaRef` splits from its name
+const SCHEMAS: &str = "/schemas/";
+
+/// The schemas whose payload is a journal entry
+///
+/// All of them carry an `event`, so one type reads them all and the variant
+/// it lands on is chosen by that event rather than by the schema.
+const JOURNAL_SCHEMAS: &[&str] = &[
+    "journal",
+    "approachsettlement",
+    "codexentry",
+    "dockingdenied",
+    "dockinggranted",
+    "fssallbodiesfound",
+    "fssbodysignals",
+    "fssdiscoveryscan",
+    "fsssignaldiscovered",
+    "navbeaconscan",
+    "navroute",
+    "scanbarycentre",
+];
+
+impl Message {
+    /// Read a payload as the schema naming it says it is
+    fn read(
+        schema_ref: &str,
+        message: serde_json::Value,
+    ) -> Result<Self, serde_json::Error> {
+        let Some((name, test)) = split_schema_ref(schema_ref) else {
+            return Ok(Message::Unmodeled(message));
+        };
+
+        if test {
+            return Ok(Message::Test(message));
+        }
+
+        Ok(match name {
+            name if JOURNAL_SCHEMAS.contains(&name) => {
+                Message::Journal(serde_json::from_value(message)?)
+            }
+            "commodity" => Message::Commodity(serde_json::from_value(message)?),
+            _ => Message::Unmodeled(message),
+        })
+    }
+}
+
+/// The schema a `$schemaRef` names, and whether it is a test schema
+///
+/// A reference reads `https://eddn.edcd.io/schemas/<name>/<version>`, with
+/// `/test` after it where the data is not from the live game. The version is
+/// not returned: no schema has ever changed a field this crate reads without
+/// also changing its name, and outfitting sending both 2 and 3 is the whole
+/// of the evidence for that.
+fn split_schema_ref(schema_ref: &str) -> Option<(&str, bool)> {
+    let (_, tail) = schema_ref.split_once(SCHEMAS)?;
+    let mut parts = tail.split('/');
+
+    let name = parts.next()?;
+    // A reference with no version is not one EDDN sends.
+    parts.next()?;
+
+    Some((name, parts.next() == Some("test")))
 }
 
 /// Subscribe to EDDN's ZMQ socket receiving all messages
@@ -240,6 +344,3 @@ impl Iterator for EnvelopeIterator {
         }
     }
 }
-
-// TODO: Make use of the schema service
-// const SCHEMA_JOURNAL : &str = "https://eddn.edcd.io/schemas/journal/1";
