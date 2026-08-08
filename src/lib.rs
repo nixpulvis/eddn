@@ -358,3 +358,231 @@ impl Iterator for EnvelopeIterator {
         }
     }
 }
+
+/// Placing a message by the schema it was sent under
+///
+/// The envelope is what decides everything here, so these go through the whole
+/// of it rather than through [`Message::read`]: what a consumer gets handed is
+/// an [`Envelope`], and how it got there is not the thing worth pinning down.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An envelope with `message` as given, and a header of no interest
+    fn envelope(schema_ref: &str, message: &str) -> Envelope {
+        let json = format!(
+            r#"{{
+                "$schemaRef": "{}",
+                "header": {{
+                    "gatewayTimestamp": "2026-08-08T12:00:00Z",
+                    "softwareName": "E:D Market Connector",
+                    "softwareVersion": "5.11.3",
+                    "uploaderID": "abc123"
+                }},
+                "message": {}
+            }}"#,
+            schema_ref, message,
+        );
+
+        serde_json::from_str(&json).expect("envelope should parse")
+    }
+
+    const JUMP: &str = r#"{
+        "timestamp": "2026-08-08T12:00:00Z",
+        "event": "FSDJump",
+        "StarSystem": "Sol",
+        "StarPos": [0.0, 0.0, 0.0],
+        "SystemAddress": 10477373803
+    }"#;
+
+    /// The schema names the payload, so a journal schema is a journal entry
+    #[test]
+    fn a_journal_message_is_a_journal_entry() {
+        let envelope = envelope("https://eddn.edcd.io/schemas/journal/1", JUMP);
+
+        assert!(matches!(envelope.message, Message::Journal(_)));
+    }
+
+    /// Every schema whose payload is a journal event reads as one
+    ///
+    /// They are separate schemas with separate names and one shape, so the
+    /// event inside is what tells them apart rather than the schema.
+    #[test]
+    fn the_standalone_journal_schemas_read_as_journal_entries() {
+        for name in super::JOURNAL_SCHEMAS {
+            let reference = format!("https://eddn.edcd.io/schemas/{}/1", name);
+            let envelope = envelope(&reference, JUMP);
+
+            assert!(
+                matches!(envelope.message, Message::Journal(_)),
+                "{} did not read as a journal entry",
+                name,
+            );
+        }
+    }
+
+    /// The three that carry no `event`, which nothing could place before
+    #[test]
+    fn the_schemas_with_no_event_are_placed_by_their_reference() {
+        let outfitting = envelope(
+            "https://eddn.edcd.io/schemas/outfitting/3",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "systemName": "Sol",
+                "stationName": "Abraham Lincoln",
+                "marketId": 128016384,
+                "modules": ["Int_Engine_Size3_Class5_Fast"]
+            }"#,
+        );
+        assert!(matches!(outfitting.message, Message::Outfitting(_)));
+
+        let shipyard = envelope(
+            "https://eddn.edcd.io/schemas/shipyard/2",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "systemName": "Sol",
+                "stationName": "Abraham Lincoln",
+                "marketId": 128016384,
+                "ships": ["SideWinder"]
+            }"#,
+        );
+        assert!(matches!(shipyard.message, Message::Shipyard(_)));
+
+        let black_market = envelope(
+            "https://eddn.edcd.io/schemas/blackmarket/1",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "systemName": "Sol",
+                "stationName": "Abraham Lincoln",
+                "name": "Gold",
+                "sellPrice": 9432,
+                "prohibited": false
+            }"#,
+        );
+        assert!(matches!(black_market.message, Message::BlackMarket(_)));
+    }
+
+    /// Both live outfitting versions are read, though their payloads differ
+    #[test]
+    fn either_outfitting_version_is_read() {
+        for (version, modules) in [
+            ("2", r#"["Int_Engine_Size3_Class5_Fast"]"#),
+            (
+                "3",
+                r#"[{
+                    "id": 128064258,
+                    "Name": "Int_Engine_Size3_Class5_Fast",
+                    "BuyPrice": 5103953,
+                    "BuyMercCoinsPrice": 0
+                }]"#,
+            ),
+        ] {
+            let reference =
+                format!("https://eddn.edcd.io/schemas/outfitting/{}", version);
+            let message = format!(
+                r#"{{
+                    "timestamp": "2026-08-08T12:00:00Z",
+                    "systemName": "Sol",
+                    "stationName": "Abraham Lincoln",
+                    "marketId": 128016384,
+                    "modules": {}
+                }}"#,
+                modules,
+            );
+
+            let envelope = envelope(&reference, &message);
+            assert!(
+                matches!(envelope.message, Message::Outfitting(_)),
+                "outfitting/{} was not read",
+                version,
+            );
+        }
+    }
+
+    /// Alpha and beta traffic is held apart from the live galaxy
+    ///
+    /// It arrives on the same socket under the same schemas, marked only by
+    /// `/test` on the end of the reference, and was being taken as real.
+    #[test]
+    fn test_schemas_are_not_live_data() {
+        let envelope =
+            envelope("https://eddn.edcd.io/schemas/journal/1/test", JUMP);
+
+        assert!(matches!(envelope.message, Message::Test(_)));
+    }
+
+    /// A schema nothing reads is kept rather than dropped
+    #[test]
+    fn an_unmodelled_schema_is_kept() {
+        let envelope = envelope(
+            "https://eddn.edcd.io/schemas/fcmaterials_journal/1",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "event": "FCMaterials",
+                "MarketID": 3700571136,
+                "CarrierID": "K7Q-BQL",
+                "CarrierName": "Nomad",
+                "Items": []
+            }"#,
+        );
+
+        assert!(matches!(envelope.message, Message::Unmodeled(_)));
+        assert_eq!(
+            envelope.schema_ref,
+            "https://eddn.edcd.io/schemas/fcmaterials_journal/1",
+        );
+    }
+
+    /// A payload that disagrees with its schema is an error, not a shrug
+    ///
+    /// This is the whole difference from guessing. A journal message whose
+    /// event will not read used to be indistinguishable from a message of
+    /// some other kind, and went in the bin without a word.
+    #[test]
+    fn a_payload_that_will_not_read_is_reported() {
+        let json = r#"{
+            "$schemaRef": "https://eddn.edcd.io/schemas/journal/1",
+            "header": {
+                "gatewayTimestamp": "2026-08-08T12:00:00Z",
+                "softwareName": "E:D Market Connector",
+                "softwareVersion": "5.11.3",
+                "uploaderID": "abc123"
+            },
+            "message": {
+                "timestamp": "2026-08-08T12:00:00Z",
+                "event": "FSDJump",
+                "StarSystem": "Sol",
+                "StarPos": "nowhere",
+                "SystemAddress": 10477373803
+            }
+        }"#;
+
+        assert!(serde_json::from_str::<Envelope>(json).is_err());
+    }
+
+    /// A reference that is not one EDDN sends places nothing, and is kept
+    #[test]
+    fn a_reference_that_makes_no_sense_is_unmodelled() {
+        assert_eq!(split_schema_ref("nonsense"), None);
+        assert_eq!(
+            split_schema_ref("https://eddn.edcd.io/schemas/journal"),
+            None,
+        );
+
+        let envelope = envelope("nonsense", JUMP);
+        assert!(matches!(envelope.message, Message::Unmodeled(_)));
+    }
+
+    /// The name and the test flag, taken off the end of the reference
+    #[test]
+    fn a_reference_splits_into_a_name_and_whether_it_is_live() {
+        assert_eq!(
+            split_schema_ref("https://eddn.edcd.io/schemas/commodity/3"),
+            Some(("commodity", false)),
+        );
+        assert_eq!(
+            split_schema_ref("https://eddn.edcd.io/schemas/shipyard/2/test"),
+            Some(("shipyard", true)),
+        );
+    }
+}
