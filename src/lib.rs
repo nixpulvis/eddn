@@ -87,15 +87,15 @@ impl<'de> Deserialize<'de> for Envelope {
         // Everything the reference has to say, taken while it is still there
         // to borrow from.
         let (message, live, version) = {
-            let named = split_schema_ref(&raw.schema_ref);
+            let schema = Schema::read(&raw.schema_ref);
 
             (
-                Message::read(named.map(|(name, ..)| name), raw.message)
+                Message::read(schema.map(|schema| schema.name), raw.message)
                     .map_err(serde::de::Error::custom)?,
-                // A reference that cannot be read names no test schema, and
-                // is taken at its word for the same reason its payload is.
-                !named.map(|(_, _, test)| test).unwrap_or(false),
-                named.map(|(_, version, _)| version.to_owned()),
+                // A reference that cannot be read marks nothing as test data,
+                // and is taken at its word for the same reason its payload is.
+                schema.map(|schema| schema.live).unwrap_or(true),
+                schema.map(|schema| schema.version.to_owned()),
             )
         };
 
@@ -205,34 +205,59 @@ impl Message {
     }
 }
 
-/// What a `$schemaRef` says: the schema, its version, and whether it is live
+/// What a `$schemaRef` says about the message beneath it
 ///
 /// A reference reads `https://eddn.edcd.io/schemas/<name>/<version>`, with
-/// `/test` after it where the data is not from the live game.
+/// `/test` after it where the data is not from the live game. All three of
+/// those answer different questions and are wanted in different places, which
+/// is why they arrive named rather than in an order somebody has to remember.
 ///
-/// The version is reported and not acted on, which is deliberate rather than
-/// an omission. Outfitting is sent under both 2 and 3 and they do differ -- 2
-/// names a module, 3 prices it -- but that is one field of one payload and is
-/// answered there by reading either. Routing on the version would put the
-/// question in the wrong place: every caller would have to know which versions
-/// of everything exist in order to ignore that they do.
-///
-/// Worth saying all the same. It is the one thing about a message that says
-/// how old the sender's idea of a schema is, and a version turning up that
-/// nothing here has heard of is worth being able to see.
-///
-/// Kept as sent rather than as a number. Every version EDDN has ever used is
-/// an integer, but nothing here counts with it, and a reference that broke
-/// that habit would be worth reading rather than worth failing on.
-fn split_schema_ref(schema_ref: &str) -> Option<(&str, &str, bool)> {
-    let (_, tail) = schema_ref.split_once(SCHEMAS)?;
-    let mut parts = tail.split('/');
+/// Borrowed from the reference it was read out of. Nothing here outlives the
+/// envelope being deserialised, and what the envelope keeps it keeps as its
+/// own fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Schema<'a> {
+    /// The schema itself, e.g. `fssdiscoveryscan`
+    ///
+    /// The only part anything routes on.
+    name: &'a str,
 
-    let name = parts.next()?;
-    // A reference with no version is not one EDDN sends.
-    let version = parts.next()?;
+    /// Which version of it the sender wrote to, as spelled in the reference
+    ///
+    /// Reported and not acted on, which is deliberate rather than an
+    /// omission. Outfitting is sent under both 2 and 3 and they do differ --
+    /// 2 names a module, 3 prices it -- but that is one field of one payload
+    /// and is answered there by reading either. Routing on the version would
+    /// put the question in the wrong place: every caller would have to know
+    /// which versions of everything exist in order to ignore that they do.
+    ///
+    /// Worth saying all the same. It is the one thing about a message that
+    /// says how old the sender's idea of a schema is.
+    ///
+    /// Kept as sent rather than as a number. Every version EDDN has ever used
+    /// is an integer, but nothing here counts with it, and a reference that
+    /// broke that habit would be worth reading rather than worth failing on.
+    version: &'a str,
 
-    Some((name, version, parts.next() == Some("test")))
+    /// Whether this is the galaxy everyone is in
+    ///
+    /// The reference says the opposite -- `/test` marks what is not live --
+    /// and it is turned round here so that nobody reading it has to.
+    live: bool,
+}
+
+impl<'a> Schema<'a> {
+    /// Read a `$schemaRef`, or nothing where it is not one EDDN sends
+    fn read(schema_ref: &'a str) -> Option<Self> {
+        let (_, tail) = schema_ref.split_once(SCHEMAS)?;
+        let mut parts = tail.split('/');
+
+        let name = parts.next()?;
+        // A reference with no version is not one EDDN sends.
+        let version = parts.next()?;
+
+        Some(Schema { name, version, live: parts.next() != Some("test") })
+    }
 }
 
 /// Subscribe to EDDN's ZMQ socket receiving all messages
@@ -636,11 +661,8 @@ mod tests {
     /// A reference that is not one EDDN sends places nothing, and is kept
     #[test]
     fn a_reference_that_makes_no_sense_is_unmodelled() {
-        assert_eq!(split_schema_ref("nonsense"), None);
-        assert_eq!(
-            split_schema_ref("https://eddn.edcd.io/schemas/journal"),
-            None,
-        );
+        assert_eq!(Schema::read("nonsense"), None);
+        assert_eq!(Schema::read("https://eddn.edcd.io/schemas/journal"), None);
 
         let envelope = envelope("nonsense", JUMP);
         assert!(matches!(envelope.message, Message::Unmodeled(_)));
@@ -648,16 +670,16 @@ mod tests {
         assert_eq!(envelope.version, None);
     }
 
-    /// The name, the version and the test flag, off the end of the reference
+    /// The name, the version and the galaxy, off the end of the reference
     #[test]
-    fn a_reference_splits_into_what_it_says() {
+    fn a_reference_reads_into_what_it_says() {
         assert_eq!(
-            split_schema_ref("https://eddn.edcd.io/schemas/commodity/3"),
-            Some(("commodity", "3", false)),
+            Schema::read("https://eddn.edcd.io/schemas/commodity/3"),
+            Some(Schema { name: "commodity", version: "3", live: true }),
         );
         assert_eq!(
-            split_schema_ref("https://eddn.edcd.io/schemas/shipyard/2/test"),
-            Some(("shipyard", "2", true)),
+            Schema::read("https://eddn.edcd.io/schemas/shipyard/2/test"),
+            Some(Schema { name: "shipyard", version: "2", live: false }),
         );
     }
 
