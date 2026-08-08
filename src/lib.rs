@@ -375,6 +375,40 @@ impl EnvelopeIterator {
     }
 }
 
+/// What a frame off the socket amounts to, or nothing where it is not ours
+///
+/// Apart from the receive, and everything a message goes through between
+/// arriving and being handed over is here rather than there: it is
+/// decompressed, read, and then either kept or dropped for describing a
+/// galaxy that is not the live one. Which means all of it can be tried
+/// without a socket for it to arrive on, including the dropping -- and a
+/// frame silently going missing is exactly the sort of thing that otherwise
+/// only shows up as a gap in a database months later.
+///
+/// [`None`] is a frame deliberately let go. A frame that could not be read at
+/// all is `Some(Err(_))`, and the difference matters: alpha and beta data
+/// arriving is ordinary, and a message that will not decompress is not.
+fn read_frame(compressed: &[u8]) -> Option<Result<Envelope, Error>> {
+    let read = inflate::decompress_to_vec_zlib(compressed)
+        .map_err(Error::Decompress)
+        .and_then(|json| {
+            serde_json::from_slice::<Envelope>(&json).map_err(Error::Parse)
+        });
+
+    // Alpha and beta data arrives on this socket alongside the live galaxy
+    // and is dropped here rather than handed over, so that a subscriber
+    // cannot record it by forgetting to ask. Whoever wants it can read an
+    // envelope directly and look at `live`.
+    if let Ok(envelope) = &read {
+        if !envelope.live {
+            debug!(schema = %envelope.schema_ref, "not live");
+            return None;
+        }
+    }
+
+    Some(read)
+}
+
 impl Iterator for EnvelopeIterator {
     type Item = Result<Envelope, Error>;
 
@@ -400,26 +434,11 @@ impl Iterator for EnvelopeIterator {
                     if let Some(stall) = &mut self.stall {
                         stall.restart();
                     }
-                    let read = inflate::decompress_to_vec_zlib(&compressed)
-                        .map_err(Error::Decompress)
-                        .and_then(|json| {
-                            serde_json::from_slice::<Envelope>(&json)
-                                .map_err(Error::Parse)
-                        });
-
-                    // Alpha and beta data arrives on this socket alongside
-                    // the live galaxy and is dropped here rather than handed
-                    // over, so that a subscriber cannot record it by
-                    // forgetting to ask. Whoever wants it can read an
-                    // envelope directly and look at `live`.
-                    if let Ok(envelope) = &read {
-                        if !envelope.live {
-                            debug!(schema = %envelope.schema_ref, "not live");
-                            continue;
-                        }
+                    if let Some(read) = read_frame(&compressed) {
+                        return Some(read);
                     }
 
-                    return Some(read);
+                    // Not ours, and nothing to report. Wait for the next.
                 }
                 // Nothing arrived within the poll interval, which is the only
                 // chance there is to see how long the quiet has run.
@@ -455,8 +474,8 @@ mod tests {
     use super::*;
 
     /// An envelope with `message` as given, and a header of no interest
-    fn envelope(schema_ref: &str, message: &str) -> Envelope {
-        let json = format!(
+    pub(super) fn envelope_json(schema_ref: &str, message: &str) -> String {
+        format!(
             r#"{{
                 "$schemaRef": "{}",
                 "header": {{
@@ -468,12 +487,23 @@ mod tests {
                 "message": {}
             }}"#,
             schema_ref, message,
-        );
-
-        serde_json::from_str(&json).expect("envelope should parse")
+        )
     }
 
-    const JUMP: &str = r#"{
+    fn envelope(schema_ref: &str, message: &str) -> Envelope {
+        serde_json::from_str(&envelope_json(schema_ref, message))
+            .expect("envelope should parse")
+    }
+
+    /// A frame as it comes off the socket: the JSON, zlib'd
+    pub(super) fn frame(schema_ref: &str, message: &str) -> Vec<u8> {
+        miniz_oxide::deflate::compress_to_vec_zlib(
+            envelope_json(schema_ref, message).as_bytes(),
+            6,
+        )
+    }
+
+    pub(super) const JUMP: &str = r#"{
         "timestamp": "2026-08-08T12:00:00Z",
         "event": "FSDJump",
         "StarSystem": "Sol",
@@ -731,5 +761,84 @@ mod tests {
 
         assert_eq!(envelope.version.as_deref(), Some("1"));
         assert!(!envelope.live);
+    }
+}
+
+/// What comes off the socket, short of the socket itself
+///
+/// [`read_frame`] is everything between a frame arriving and a subscriber
+/// being handed it, which is where the one decision lives that nothing else
+/// can see: a frame deliberately let go looks exactly like a frame that never
+/// arrived. These are what say the difference is on purpose.
+#[cfg(test)]
+mod frames {
+    use super::tests::{envelope_json, frame, JUMP};
+    use super::*;
+
+    const JOURNAL: &str = "https://eddn.edcd.io/schemas/journal/1";
+    const JOURNAL_TEST: &str = "https://eddn.edcd.io/schemas/journal/1/test";
+
+    /// Live data is handed over
+    #[test]
+    fn a_live_frame_is_handed_over() {
+        let read = read_frame(&frame(JOURNAL, JUMP))
+            .expect("a live frame should be handed over");
+
+        let envelope = read.expect("and should read");
+        assert!(envelope.live);
+        assert!(matches!(envelope.message, Message::Journal(_)));
+    }
+
+    /// And alpha and beta data is not
+    ///
+    /// The whole of what `live` is for. Asserting the flag says the reference
+    /// was understood; this says something acts on it.
+    #[test]
+    fn a_test_frame_is_let_go() {
+        assert!(read_frame(&frame(JOURNAL_TEST, JUMP)).is_none());
+    }
+
+    /// A frame that is not zlib is reported rather than let go
+    ///
+    /// The difference the return type is for. Beta data arriving is ordinary
+    /// and worth nothing but silence; a frame that will not decompress is the
+    /// gateway or this crate being wrong, and going quiet about it would
+    /// leave nothing to notice.
+    #[test]
+    fn a_frame_that_is_not_zlib_is_reported() {
+        assert!(matches!(
+            read_frame(b"not zlib at all"),
+            Some(Err(Error::Decompress(_))),
+        ));
+    }
+
+    /// So is one that decompresses into something that is not an envelope
+    #[test]
+    fn a_frame_that_is_not_an_envelope_is_reported() {
+        let rubbish = miniz_oxide::deflate::compress_to_vec_zlib(b"{}", 6);
+
+        assert!(matches!(read_frame(&rubbish), Some(Err(Error::Parse(_)))));
+    }
+
+    /// And one whose payload disagrees with its schema
+    ///
+    /// Which used to be indistinguishable from a message of some other kind,
+    /// and went in the bin without a word.
+    #[test]
+    fn a_frame_whose_payload_will_not_read_is_reported() {
+        let json = envelope_json(
+            JOURNAL,
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "event": "FSDJump",
+                "StarSystem": "Sol",
+                "StarPos": "nowhere",
+                "SystemAddress": 10477373803
+            }"#,
+        );
+        let bad =
+            miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 6);
+
+        assert!(matches!(read_frame(&bad), Some(Err(Error::Parse(_)))));
     }
 }
