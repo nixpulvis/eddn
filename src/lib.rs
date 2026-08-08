@@ -50,6 +50,19 @@ pub struct Envelope {
     /// [`subscribe`] never yields an envelope with this false. It is on the
     /// type for whoever reads an envelope some other way.
     pub live: bool,
+
+    /// Which version of its schema the sender wrote to, as the reference
+    /// spells it
+    ///
+    /// Nothing routes on this and nothing should: what the two live outfitting
+    /// versions disagree about is one field of one payload, and is answered by
+    /// reading either. It is here to be looked at. A sender still on an old
+    /// version, or a version nothing here has heard of, does not announce
+    /// itself any other way.
+    ///
+    /// [`None`] only where the reference is not one EDDN sends, which is the
+    /// same case that leaves a message [`Message::Unmodeled`].
+    pub version: Option<String>,
 }
 
 /// What the envelope looks like before its payload has been placed
@@ -71,17 +84,18 @@ impl<'de> Deserialize<'de> for Envelope {
     {
         let raw = RawEnvelope::deserialize(deserializer)?;
 
-        // Both answers come off the reference, and are taken while it is
-        // still there to borrow from.
-        let (message, live) = {
+        // Everything the reference has to say, taken while it is still there
+        // to borrow from.
+        let (message, live, version) = {
             let named = split_schema_ref(&raw.schema_ref);
 
             (
-                Message::read(named.map(|(name, _)| name), raw.message)
+                Message::read(named.map(|(name, ..)| name), raw.message)
                     .map_err(serde::de::Error::custom)?,
                 // A reference that cannot be read names no test schema, and
                 // is taken at its word for the same reason its payload is.
-                !named.map(|(_, test)| test).unwrap_or(false),
+                !named.map(|(_, _, test)| test).unwrap_or(false),
+                named.map(|(_, version, _)| version.to_owned()),
             )
         };
 
@@ -90,6 +104,7 @@ impl<'de> Deserialize<'de> for Envelope {
             header: raw.header,
             message,
             live,
+            version,
         })
     }
 }
@@ -190,25 +205,34 @@ impl Message {
     }
 }
 
-/// The schema a `$schemaRef` names, and whether it is a test schema
+/// What a `$schemaRef` says: the schema, its version, and whether it is live
 ///
 /// A reference reads `https://eddn.edcd.io/schemas/<name>/<version>`, with
 /// `/test` after it where the data is not from the live game.
 ///
-/// The version is not returned. Outfitting is sent under both 2 and 3 and they
-/// do differ -- 2 names a module, 3 prices it -- but that is one field of one
-/// payload, and is answered there by reading either. Handing a version back
-/// would put the question in the wrong place: every caller would have to know
-/// which versions of everything exist in order to ignore that they do.
-fn split_schema_ref(schema_ref: &str) -> Option<(&str, bool)> {
+/// The version is reported and not acted on, which is deliberate rather than
+/// an omission. Outfitting is sent under both 2 and 3 and they do differ -- 2
+/// names a module, 3 prices it -- but that is one field of one payload and is
+/// answered there by reading either. Routing on the version would put the
+/// question in the wrong place: every caller would have to know which versions
+/// of everything exist in order to ignore that they do.
+///
+/// Worth saying all the same. It is the one thing about a message that says
+/// how old the sender's idea of a schema is, and a version turning up that
+/// nothing here has heard of is worth being able to see.
+///
+/// Kept as sent rather than as a number. Every version EDDN has ever used is
+/// an integer, but nothing here counts with it, and a reference that broke
+/// that habit would be worth reading rather than worth failing on.
+fn split_schema_ref(schema_ref: &str) -> Option<(&str, &str, bool)> {
     let (_, tail) = schema_ref.split_once(SCHEMAS)?;
     let mut parts = tail.split('/');
 
     let name = parts.next()?;
     // A reference with no version is not one EDDN sends.
-    parts.next()?;
+    let version = parts.next()?;
 
-    Some((name, parts.next() == Some("test")))
+    Some((name, version, parts.next() == Some("test")))
 }
 
 /// Subscribe to EDDN's ZMQ socket receiving all messages
@@ -620,18 +644,70 @@ mod tests {
 
         let envelope = envelope("nonsense", JUMP);
         assert!(matches!(envelope.message, Message::Unmodeled(_)));
+        // Nothing to report, rather than a version invented for the occasion.
+        assert_eq!(envelope.version, None);
     }
 
-    /// The name and the test flag, taken off the end of the reference
+    /// The name, the version and the test flag, off the end of the reference
     #[test]
-    fn a_reference_splits_into_a_name_and_whether_it_is_live() {
+    fn a_reference_splits_into_what_it_says() {
         assert_eq!(
             split_schema_ref("https://eddn.edcd.io/schemas/commodity/3"),
-            Some(("commodity", false)),
+            Some(("commodity", "3", false)),
         );
         assert_eq!(
             split_schema_ref("https://eddn.edcd.io/schemas/shipyard/2/test"),
-            Some(("shipyard", true)),
+            Some(("shipyard", "2", true)),
         );
+    }
+
+    /// The version is reported without being acted on
+    ///
+    /// Both live outfitting versions reach the same variant, which is the
+    /// whole argument for not routing on it -- and the envelope still says
+    /// which one arrived, which is the whole argument for keeping it.
+    #[test]
+    fn the_version_is_said_even_though_nothing_turns_on_it() {
+        let old = envelope(
+            "https://eddn.edcd.io/schemas/outfitting/2",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "systemName": "Sol",
+                "stationName": "Abraham Lincoln",
+                "marketId": 128016384,
+                "modules": ["Int_Engine_Size3_Class5_Fast"]
+            }"#,
+        );
+        let new = envelope(
+            "https://eddn.edcd.io/schemas/outfitting/3",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "systemName": "Sol",
+                "stationName": "Abraham Lincoln",
+                "marketId": 128016384,
+                "modules": [{
+                    "id": 128064258,
+                    "Name": "Int_Engine_Size3_Class5_Fast",
+                    "BuyPrice": 5103953,
+                    "BuyMercCoinsPrice": 0
+                }]
+            }"#,
+        );
+
+        assert_eq!(old.version.as_deref(), Some("2"));
+        assert_eq!(new.version.as_deref(), Some("3"));
+
+        assert!(matches!(old.message, Message::Outfitting(_)));
+        assert!(matches!(new.message, Message::Outfitting(_)));
+    }
+
+    /// A test schema is still a version of something
+    #[test]
+    fn a_test_schema_reports_its_version_too() {
+        let envelope =
+            envelope("https://eddn.edcd.io/schemas/journal/1/test", JUMP);
+
+        assert_eq!(envelope.version.as_deref(), Some("1"));
+        assert!(!envelope.live);
     }
 }
