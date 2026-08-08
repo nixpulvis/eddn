@@ -25,7 +25,7 @@ use miniz_oxide::inflate;
 use serde::Deserialize;
 use std::thread;
 use std::time::Duration;
-use tracing::{info, warn, Level};
+use tracing::{debug, info, warn, Level};
 
 pub const URL: &'static str = "tcp://eddn.edcd.io:9500";
 
@@ -35,6 +35,21 @@ pub struct Envelope {
     pub schema_ref: String,
     pub header: Header,
     pub message: Message,
+
+    /// Whether this is the galaxy everyone is in
+    ///
+    /// EDDN carries alpha and beta game data on the same socket as live data,
+    /// separated only by a `/test` suffix on the `$schemaRef`. It parses like
+    /// anything else and describes somewhere that is not the live galaxy, so
+    /// recording it is a mistake rather than a choice.
+    ///
+    /// Here rather than on [`Message`], which says what a payload holds. This
+    /// says where it came from, and the two are independent: a test message is
+    /// still a journal message or a market message, and reads as one.
+    ///
+    /// [`subscribe`] never yields an envelope with this false. It is on the
+    /// type for whoever reads an envelope some other way.
+    pub live: bool,
 }
 
 /// What the envelope looks like before its payload has been placed
@@ -55,10 +70,27 @@ impl<'de> Deserialize<'de> for Envelope {
         D: serde::Deserializer<'de>,
     {
         let raw = RawEnvelope::deserialize(deserializer)?;
-        let message = Message::read(&raw.schema_ref, raw.message)
-            .map_err(serde::de::Error::custom)?;
 
-        Ok(Envelope { schema_ref: raw.schema_ref, header: raw.header, message })
+        // Both answers come off the reference, and are taken while it is
+        // still there to borrow from.
+        let (message, live) = {
+            let named = split_schema_ref(&raw.schema_ref);
+
+            (
+                Message::read(named.map(|(name, _)| name), raw.message)
+                    .map_err(serde::de::Error::custom)?,
+                // A reference that cannot be read names no test schema, and
+                // is taken at its word for the same reason its payload is.
+                !named.map(|(_, test)| test).unwrap_or(false),
+            )
+        };
+
+        Ok(Envelope {
+            schema_ref: raw.schema_ref,
+            header: raw.header,
+            message,
+            live,
+        })
     }
 }
 
@@ -97,19 +129,11 @@ pub enum Message {
     Shipyard(Entry<Shipyard>),
     BlackMarket(Entry<BlackMarket>),
 
-    /// A live schema this crate does not read yet
+    /// A schema this crate does not read yet
     ///
     /// Kept as JSON rather than dropped, so that what is going unread can be
     /// seen by whoever is looking.
     Unmodeled(serde_json::Value),
-
-    /// Anything sent under a `/test` schema
-    ///
-    /// EDDN carries alpha and beta game data on the same socket as live data,
-    /// separated only by a `/test` suffix on the `$schemaRef`. It describes a
-    /// galaxy that is not this one, so it is parted from live data here and
-    /// left for the consumer to discard.
-    Test(serde_json::Value),
 }
 
 /// Where every EDDN `$schemaRef` splits from its name
@@ -136,17 +160,18 @@ const JOURNAL_SCHEMAS: &[&str] = &[
 
 impl Message {
     /// Read a payload as the schema naming it says it is
+    ///
+    /// Whether the schema was a test one makes no difference here. A payload
+    /// sent under `journal/1/test` is shaped exactly like one sent under
+    /// `journal/1` and is read as one; what is not the same is the galaxy it
+    /// describes, which is [`Envelope::live`]'s to say.
     fn read(
-        schema_ref: &str,
+        name: Option<&str>,
         message: serde_json::Value,
     ) -> Result<Self, serde_json::Error> {
-        let Some((name, test)) = split_schema_ref(schema_ref) else {
+        let Some(name) = name else {
             return Ok(Message::Unmodeled(message));
         };
-
-        if test {
-            return Ok(Message::Test(message));
-        }
 
         Ok(match name {
             name if JOURNAL_SCHEMAS.contains(&name) => {
@@ -326,14 +351,26 @@ impl Iterator for EnvelopeIterator {
                     if let Some(stall) = &mut self.stall {
                         stall.restart();
                     }
-                    return Some(
-                        inflate::decompress_to_vec_zlib(&compressed)
-                            .map_err(Error::Decompress)
-                            .and_then(|json| {
-                                serde_json::from_slice(&json)
-                                    .map_err(Error::Parse)
-                            }),
-                    );
+                    let read = inflate::decompress_to_vec_zlib(&compressed)
+                        .map_err(Error::Decompress)
+                        .and_then(|json| {
+                            serde_json::from_slice::<Envelope>(&json)
+                                .map_err(Error::Parse)
+                        });
+
+                    // Alpha and beta data arrives on this socket alongside
+                    // the live galaxy and is dropped here rather than handed
+                    // over, so that a subscriber cannot record it by
+                    // forgetting to ask. Whoever wants it can read an
+                    // envelope directly and look at `live`.
+                    if let Ok(envelope) = &read {
+                        if !envelope.live {
+                            debug!(schema = %envelope.schema_ref, "not live");
+                            continue;
+                        }
+                    }
+
+                    return Some(read);
                 }
                 // Nothing arrived within the poll interval, which is the only
                 // chance there is to see how long the quiet has run.
@@ -499,16 +536,28 @@ mod tests {
         }
     }
 
-    /// Alpha and beta traffic is held apart from the live galaxy
+    /// Alpha and beta traffic is marked, not turned into something else
     ///
-    /// It arrives on the same socket under the same schemas, marked only by
-    /// `/test` on the end of the reference, and was being taken as real.
+    /// It arrives on the same socket under the same schemas, separated only by
+    /// `/test` on the end of the reference, and was being taken as real. The
+    /// payload is a journal entry either way -- that is what the schema says
+    /// it is -- and which galaxy it describes is the envelope's to say.
+    ///
+    /// `subscribe` drops these, so nothing downstream has to remember to.
     #[test]
-    fn test_schemas_are_not_live_data() {
+    fn test_schemas_are_read_but_not_live() {
         let envelope =
             envelope("https://eddn.edcd.io/schemas/journal/1/test", JUMP);
 
-        assert!(matches!(envelope.message, Message::Test(_)));
+        assert!(!envelope.live);
+        assert!(matches!(envelope.message, Message::Journal(_)));
+    }
+
+    /// Everything else is the live galaxy
+    #[test]
+    fn an_ordinary_schema_is_live() {
+        assert!(envelope("https://eddn.edcd.io/schemas/journal/1", JUMP).live);
+        assert!(envelope("nonsense", JUMP).live);
     }
 
     /// A schema nothing reads is kept rather than dropped
