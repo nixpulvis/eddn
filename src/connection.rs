@@ -50,6 +50,14 @@ pub const HEARTBEAT_IVL_MS: i32 = 5_000;
 /// together bound how long [a connection that has died without
 /// closing](crate::subscribe#a-connection-that-dies-without-closing) is
 /// mistaken for a quiet one.
+///
+/// A subscriber at the receive high water mark cannot read the PONGs it is
+/// waiting for, so this expires on a live connection and the engine swap
+/// behind it aborts libzmq. [#4767] is that bug, [#4830] the fix, open since
+/// January 2026. See `ISSUE-eddn-zmq-assert.md`.
+///
+/// [#4767]: https://github.com/zeromq/libzmq/issues/4767
+/// [#4830]: https://github.com/zeromq/libzmq/pull/4830
 pub const HEARTBEAT_TIMEOUT_MS: i32 = 10_000;
 
 /// What to ask libzmq's socket monitor to report
