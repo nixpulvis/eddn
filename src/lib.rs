@@ -392,7 +392,15 @@ fn read_frame(compressed: &[u8]) -> Option<Result<Envelope, Error>> {
     let read = inflate::decompress_to_vec_zlib(compressed)
         .map_err(Error::Decompress)
         .and_then(|json| {
-            serde_json::from_slice::<Envelope>(&json).map_err(Error::Parse)
+            serde_json::from_slice::<Envelope>(&json).map_err(|source| {
+                // Lossy because the message is being kept to be read by a
+                // person, and one carrying bytes that are not UTF-8 is a
+                // message worth seeing rather than one to give up on twice.
+                Error::Parse {
+                    source,
+                    json: String::from_utf8_lossy(&json).into_owned(),
+                }
+            })
         });
 
     // Alpha and beta data arrives on this socket alongside the live galaxy
@@ -817,7 +825,7 @@ mod frames {
     fn a_frame_that_is_not_an_envelope_is_reported() {
         let rubbish = miniz_oxide::deflate::compress_to_vec_zlib(b"{}", 6);
 
-        assert!(matches!(read_frame(&rubbish), Some(Err(Error::Parse(_)))));
+        assert!(matches!(read_frame(&rubbish), Some(Err(Error::Parse { .. }))));
     }
 
     /// And one whose payload disagrees with its schema
@@ -839,6 +847,59 @@ mod frames {
         let bad =
             miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 6);
 
-        assert!(matches!(read_frame(&bad), Some(Err(Error::Parse(_)))));
+        assert!(matches!(read_frame(&bad), Some(Err(Error::Parse { .. }))));
+    }
+
+    /// A payload error carries the message, so the field can be found
+    ///
+    /// `invalid type: string "", expected i32` of a thirty field message says
+    /// something in the feed is wrong and nothing about where, and a message
+    /// nobody kept cannot be gone back to. There is no offset and no field path
+    /// to be had here, so what makes it traceable is keeping the message.
+    #[test]
+    fn a_payload_error_keeps_the_message_it_could_not_read() {
+        let json = envelope_json(
+            "https://eddn.edcd.io/schemas/fssdiscoveryscan/1",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "event": "FSSDiscoveryScan",
+                "SystemName": "Sol",
+                "StarPos": [0.0, 0.0, 0.0],
+                "SystemAddress": 10477373803,
+                "BodyCount": "",
+                "NonBodyCount": 3,
+                "Progress": 1.0
+            }"#,
+        );
+        let bad =
+            miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 6);
+
+        let Some(Err(err)) = read_frame(&bad) else {
+            panic!("a payload that will not read should be reported")
+        };
+        let said = err.to_string();
+
+        assert!(said.contains("BodyCount"), "did not name the field: {}", said,);
+        // Read out of a value, so there is no offset to point at and none is
+        // offered. The path above is what locates it.
+        assert!(err.near().is_none(), "pointed somewhere anyway: {}", said);
+    }
+
+    /// A malformed envelope does point at where reading stopped
+    ///
+    /// Here there is text and an offset into it, so the window is the answer.
+    #[test]
+    fn a_malformed_envelope_shows_where_it_stopped() {
+        let truncated = miniz_oxide::deflate::compress_to_vec_zlib(
+            br#"{"$schemaRef": "https://eddn.edcd.io/schemas/journal/1", "heade"#,
+            6,
+        );
+
+        let Some(Err(err)) = read_frame(&truncated) else {
+            panic!("a malformed envelope should be reported")
+        };
+
+        let near = err.near().expect("should point at where it stopped");
+        assert!(near.contains("heade"), "pointed elsewhere: {}", near);
     }
 }
