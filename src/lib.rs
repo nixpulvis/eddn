@@ -11,8 +11,7 @@ mod error;
 mod reporter;
 
 pub use crate::connection::{
-    HEARTBEAT_IVL, HEARTBEAT_TIMEOUT, POLL_INTERVAL, RECONNECT_MAX,
-    RECONNECT_MIN,
+    IDLE_TIMEOUT, PING_INTERVAL, POLL_INTERVAL, RECONNECT_MAX, RECONNECT_MIN,
 };
 pub use crate::error::Error;
 
@@ -294,7 +293,7 @@ impl<'a> Schema<'a> {
 /// brings nothing back at all -- no answer to it, no data either -- runs out
 /// of time and is closed, so the case above takes over from there.
 ///
-/// How long that takes is [`HEARTBEAT_IVL`] and [`HEARTBEAT_TIMEOUT`].
+/// How long that takes is [`PING_INTERVAL`] and [`IDLE_TIMEOUT`].
 ///
 /// ## A gateway that stops publishing
 ///

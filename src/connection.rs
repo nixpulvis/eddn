@@ -38,26 +38,23 @@ pub const RECONNECT_MAX: Duration = Duration::from_secs(15);
 ///
 /// A ping is a write, and a write is what turns [a connection that has died
 /// without closing](crate::subscribe#a-connection-that-dies-without-closing)
-/// into something the socket can see. With [`HEARTBEAT_TIMEOUT`] this is how
-/// long that goes unnoticed, so 15 seconds.
+/// into something the socket can see. With [`IDLE_TIMEOUT`] this is how long
+/// that goes unnoticed, so 15 seconds.
 ///
 /// It can be this short because the answers do come. EDDN speaks ZMTP 3.1 and
 /// returns a PONG for every PING, so a connection sitting quiet is still held
 /// open by the answers to its pings, and only a broken one runs out of time.
-pub const HEARTBEAT_IVL: Duration = Duration::from_secs(5);
+pub const PING_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long to wait for anything back after a ping
+/// The longest a connection may carry nothing before it is given up
 ///
-/// Nothing arriving inside this and the connection is given up and another
-/// built. Counted from a ping sent every [`HEARTBEAT_IVL`], so the two
-/// together bound how long [a connection that has died without
+/// Anything arriving satisfies it, a message as much as a PONG, so a gateway
+/// publishing steadily holds its connection without ever answering a ping.
+/// Counted from a ping sent every [`PING_INTERVAL`], the two together bound
+/// how long [a connection that has died without
 /// closing](crate::subscribe#a-connection-that-dies-without-closing) is
 /// mistaken for a quiet one.
-///
-/// It is any traffic that holds a connection open here, not a PONG in
-/// particular, so a gateway publishing steadily satisfies it without ever
-/// answering a ping.
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a socket subscribed to EDDN is opened with
 ///
@@ -71,8 +68,8 @@ pub(crate) fn options() -> Options {
             min: RECONNECT_MIN,
             max: RECONNECT_MAX,
         })
-        .heartbeat_interval(HEARTBEAT_IVL)
-        .heartbeat_timeout(HEARTBEAT_TIMEOUT)
+        .heartbeat_interval(PING_INTERVAL)
+        .heartbeat_timeout(IDLE_TIMEOUT)
 }
 
 /// A socket subscribed to EDDN, and the monitor it reports on
