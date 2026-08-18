@@ -12,7 +12,7 @@ mod reporter;
 
 pub use crate::connection::{
     HEARTBEAT_IVL, HEARTBEAT_TIMEOUT, POLL_INTERVAL, RECONNECT_MAX,
-    RECONNECT_MIN, RECV_HWM,
+    RECONNECT_MIN,
 };
 pub use crate::error::Error;
 
@@ -277,10 +277,10 @@ impl<'a> Schema<'a> {
 /// ## A connection that closes
 ///
 /// The gateway restarts, or something between here and it drops the
-/// connection and says so. libzmq sees the close, throws the connection away
-/// and builds another, retrying until one takes. This has always worked.
+/// connection and says so. The socket sees the close, throws the connection
+/// away and builds another, retrying until one takes.
 ///
-/// How hard it tries is [`RECONNECT_MIN_MS`] and [`RECONNECT_MAX_MS`].
+/// How hard it tries is [`RECONNECT_MIN`] and [`RECONNECT_MAX`].
 ///
 /// ## A connection that dies without closing
 ///
@@ -290,20 +290,20 @@ impl<'a> Schema<'a> {
 /// like a working connection that happens to be quiet, and a subscriber can
 /// wait on it for as long as it runs.
 ///
-/// Heartbeats tell the two apart. A ping is a write, and a ping that goes
-/// unanswered is a failure libzmq can see, so it closes the connection and
-/// the case above takes over from there.
+/// Heartbeats tell the two apart. A ping is a write, and a connection that
+/// brings nothing back at all -- no answer to it, no data either -- runs out
+/// of time and is closed, so the case above takes over from there.
 ///
-/// How long that takes is [`HEARTBEAT_IVL_MS`] and [`HEARTBEAT_TIMEOUT_MS`].
+/// How long that takes is [`HEARTBEAT_IVL`] and [`HEARTBEAT_TIMEOUT`].
 ///
 /// ## A gateway that stops publishing
 ///
 /// The connection is in good health and carries nothing. Pings are answered
-/// by libzmq's own thread inside the gateway, which knows nothing about
-/// whether the program above it is still publishing, so heartbeats report
-/// the connection as fine and are right to. Only counting the silence finds
+/// down in the gateway's socket, which knows nothing about whether the
+/// program above it is still publishing, so heartbeats report the connection
+/// as fine and are right to. Only counting the silence finds
 /// this one, which is what `stall_timeout` counts, in the gaps a receive
-/// leaves by coming back empty every [`POLL_INTERVAL_MS`].
+/// leaves by coming back empty every [`POLL_INTERVAL`].
 ///
 /// How long to give it is a question about the gateway rather than about
 /// this crate, which is why there is no default. EDDN at a busy hour carried
@@ -319,8 +319,8 @@ pub fn subscribe(
         Connection::open(&ctx, url).expect("failed to open socket");
 
     // Not "connected". Connecting is asynchronous, and whether it took is
-    // reported when libzmq knows, along with everything later that happens
-    // to it.
+    // reported when the socket knows, along with everything later that
+    // happens to it.
     info!("Subscribed to {}", url);
 
     EnvelopeIterator {
@@ -349,9 +349,9 @@ pub struct EnvelopeIterator {
 impl EnvelopeIterator {
     /// Throw the connection away and take a new one
     ///
-    /// For a connection in the picture of health that carries nothing. libzmq
-    /// has no complaint to make about it and so will not rebuild it, and the
-    /// only way to a new one is a socket it has never seen.
+    /// For a connection in the picture of health that carries nothing.
+    /// Nothing about it has failed, so it will not be rebuilt on its own, and
+    /// a new one is had by opening a socket in its place.
     fn reconnect(&mut self, reason: &str) {
         // Not the reporter's throttle. This happens once a stall timeout at
         // the very most, and is worth hearing about every time it does.

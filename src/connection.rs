@@ -59,22 +59,12 @@ pub const HEARTBEAT_IVL: Duration = Duration::from_secs(5);
 /// answering a ping.
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How many messages the socket holds for a subscriber that is behind
-///
-/// The receiving thread writes each message to a database before it asks for
-/// the next, and EDDN publishes around 31 a second, so a subscriber that
-/// falls behind falls behind by a lot. What is held here is what it may catch
-/// up on; past this the connection stops being read and the gateway's own
-/// queue takes over.
-pub const RECV_HWM: u32 = 1_000;
-
 /// What a socket subscribed to EDDN is opened with
 ///
 /// Everything the connection's health depends on is here rather than left to
 /// a default, since the defaults are for a peer on a LAN that answers.
 pub(crate) fn options() -> Options {
     Options::new()
-        .recv_hwm(RECV_HWM)
         .reconnect(ReconnectPolicy::Exponential {
             min: RECONNECT_MIN,
             max: RECONNECT_MAX,
