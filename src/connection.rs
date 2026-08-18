@@ -96,7 +96,7 @@ impl Connection {
         let monitor = socket.monitor();
 
         socket.connect(endpoint)?;
-        socket.subscribe(&b""[..])?; // Required to subscribe to everything
+        socket.subscribe("")?; // Required to subscribe to everything
 
         Ok(Connection { socket, monitor })
     }

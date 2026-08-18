@@ -443,13 +443,19 @@ impl Iterator for EnvelopeIterator {
                     if let Some(stall) = &mut self.stall {
                         stall.restart();
                     }
-                    // EDDN sends one frame, and a message that is not one
-                    // frame is not ours to read.
-                    if let Some(read) = read_frame(&message[0]) {
+                    let frame = match message.get(0) {
+                        Some(frame) => frame,
+                        None => {
+                            debug!("a message carrying no frame");
+                            continue;
+                        }
+                    };
+
+                    if let Some(read) = read_frame(frame) {
                         return Some(read);
                     }
 
-                    // Not ours, and nothing to report. Wait for the next.
+                    // A `/test` message, which `read_frame` drops.
                 }
                 // Nothing arrived within the poll interval, which is the only
                 // chance there is to see how long the quiet has run.
