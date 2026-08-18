@@ -11,8 +11,8 @@ mod error;
 mod reporter;
 
 pub use crate::connection::{
-    HEARTBEAT_IVL_MS, HEARTBEAT_TIMEOUT_MS, POLL_INTERVAL_MS, RECONNECT_MAX_MS,
-    RECONNECT_MIN_MS,
+    HEARTBEAT_IVL, HEARTBEAT_TIMEOUT, POLL_INTERVAL, RECONNECT_MAX,
+    RECONNECT_MIN, RECV_HWM,
 };
 pub use crate::error::Error;
 
@@ -22,6 +22,7 @@ use chrono::prelude::*;
 use elite_journal::entry::market::{BlackMarket, Outfitting, Shipyard};
 use elite_journal::entry::{Entry, Event, Market};
 use miniz_oxide::inflate;
+use omq_tokio::Context;
 use serde::Deserialize;
 use std::thread;
 use std::time::Duration;
@@ -313,7 +314,7 @@ pub fn subscribe(
     url: &str,
     stall_timeout: Option<Duration>,
 ) -> EnvelopeIterator {
-    let ctx = zmq::Context::new();
+    let ctx = Context::new();
     let connection =
         Connection::open(&ctx, url).expect("failed to open socket");
 
@@ -337,7 +338,7 @@ pub fn subscribe(
 /// [`Error`] and the next one is waited for, and a connection that stops
 /// carrying messages is replaced.
 pub struct EnvelopeIterator {
-    ctx: zmq::Context,
+    ctx: Context,
     url: String,
     connection: Connection,
     reports: Reporter,
@@ -437,12 +438,14 @@ impl Iterator for EnvelopeIterator {
                 }
             }
 
-            match self.connection.socket.recv_bytes(0) {
-                Ok(compressed) => {
+            match self.connection.socket.recv_timeout(POLL_INTERVAL) {
+                Ok(message) => {
                     if let Some(stall) = &mut self.stall {
                         stall.restart();
                     }
-                    if let Some(read) = read_frame(&compressed) {
+                    // EDDN sends one frame, and a message that is not one
+                    // frame is not ours to read.
+                    if let Some(read) = read_frame(&message[0]) {
                         return Some(read);
                     }
 
@@ -450,7 +453,7 @@ impl Iterator for EnvelopeIterator {
                 }
                 // Nothing arrived within the poll interval, which is the only
                 // chance there is to see how long the quiet has run.
-                Err(zmq::Error::EAGAIN) => {
+                Err(omq_tokio::Error::Timeout) => {
                     let overrun = self.stall.as_ref().and_then(Stall::overrun);
                     if let Some(quiet) = overrun {
                         let reason =
@@ -458,9 +461,6 @@ impl Iterator for EnvelopeIterator {
                         self.reconnect(&reason);
                     }
                 }
-                // A signal interrupted the wait, which says nothing about the
-                // connection.
-                Err(zmq::Error::EINTR) => {}
                 // Anything else is the socket itself, and it will keep giving
                 // the same answer until it is replaced.
                 Err(err) => {

@@ -1,4 +1,5 @@
-use crate::connection::{RECONNECT_MAX_MS, RECONNECT_MIN_MS};
+use crate::connection::{RECONNECT_MAX, RECONNECT_MIN};
+use omq_tokio::MonitorEvent;
 use std::time::{Duration, Instant};
 use tracing::Level;
 
@@ -16,7 +17,7 @@ pub(crate) struct Note {
 /// See [`Reporter`] for what this holds back and why.
 const WARN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Decides what is worth saying about what libzmq does to the connection
+/// Decides what is worth saying about what the socket does to the connection
 ///
 /// Losing a connection is worth hearing about. A gateway that accepts and
 /// drops on repeat loses one every second, and saying so every second buries
@@ -27,8 +28,8 @@ const WARN_INTERVAL: Duration = Duration::from_secs(30);
 /// Being told a connection went away and never told it came back reads as an
 /// outage that is still going.
 ///
-/// This throttle is for events that arrive as fast as libzmq can produce
-/// them. Everything the subscriber does deliberately, being rare by
+/// This throttle is for events that arrive as fast as the socket can
+/// produce them. Everything the subscriber does deliberately, being rare by
 /// construction, is reported without asking.
 #[derive(Default)]
 pub(crate) struct Reporter {
@@ -43,13 +44,13 @@ pub(crate) struct Reporter {
 }
 
 impl Reporter {
-    /// What is worth saying about what libzmq has done on its own
-    pub(crate) fn observe(&mut self, events: &[zmq::SocketEvent]) -> Vec<Note> {
+    /// What is worth saying about what the socket has done on its own
+    pub(crate) fn observe(&mut self, events: &[MonitorEvent]) -> Vec<Note> {
         let mut said = Vec::new();
 
         for event in events {
             match event {
-                zmq::SocketEvent::DISCONNECTED if self.lost_at.is_none() => {
+                MonitorEvent::Disconnected { .. } if self.lost_at.is_none() => {
                     self.lost_at = Some(Instant::now());
                     // Said once and then held back, and nothing more is said
                     // until the connection is back, however long that takes.
@@ -58,13 +59,13 @@ impl Reporter {
                     self.loss_reported = self.warn(
                         &format!(
                             "Connection lost, retrying every {} to {} seconds",
-                            RECONNECT_MIN_MS / 1_000,
-                            RECONNECT_MAX_MS / 1_000,
+                            RECONNECT_MIN.as_secs(),
+                            RECONNECT_MAX.as_secs(),
                         ),
                         &mut said,
                     );
                 }
-                zmq::SocketEvent::CONNECTED => {
+                MonitorEvent::Connected { .. } => {
                     if let Some(at) = self.lost_at.take() {
                         // Only if its loss was, so the two come as a pair.
                         // The connection is working again, so this is news
@@ -80,11 +81,13 @@ impl Reporter {
                         }
                     }
                 }
-                zmq::SocketEvent::HANDSHAKE_FAILED_NO_DETAIL
-                | zmq::SocketEvent::HANDSHAKE_FAILED_PROTOCOL
-                | zmq::SocketEvent::HANDSHAKE_FAILED_AUTH => {
+                // Says what went wrong rather than naming the peer. A
+                // handshake that does not finish is as often a middlebox
+                // holding the connection open as it is the wrong port, and
+                // the reason is the only thing that tells them apart.
+                MonitorEvent::HandshakeFailed { reason, .. } => {
                     self.warn(
-                        "Connected to something that is not EDDN",
+                        &format!("Handshake did not finish: {}", reason),
                         &mut said,
                     );
                 }
@@ -125,7 +128,38 @@ impl Reporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zmq::SocketEvent::*;
+    use omq_tokio::socket::{DisconnectReason, PeerInfo};
+
+    /// The gateway's endpoint, which none of these turn on.
+    fn endpoint() -> omq_tokio::Endpoint {
+        "tcp://127.0.0.1:9500".parse().unwrap()
+    }
+
+    /// A connection lost, however it was lost.
+    fn lost() -> MonitorEvent {
+        MonitorEvent::Disconnected {
+            endpoint: endpoint(),
+            peer: PeerInfo {
+                connection_id: 1,
+                peer_address: None,
+                peer_identity: None,
+                peer_properties: Default::default(),
+                zmtp_version: (3, 1),
+            },
+            reason: DisconnectReason::PeerClosed,
+        }
+    }
+
+    /// A connection made, which is what ends one being lost.
+    fn found() -> MonitorEvent {
+        MonitorEvent::Connected {
+            endpoint: endpoint(),
+            peer_ident: omq_tokio::socket::PeerIdent::Socket(
+                "127.0.0.1:9500".parse().unwrap(),
+            ),
+            connection_id: 1,
+        }
+    }
 
     /// Move the clock back on what the reporter remembers, so a test does not
     /// have to wait out an interval to see the far side of one.
@@ -139,7 +173,7 @@ mod tests {
 
         // The first loss is worth saying, and so is the recovery ending it.
         // The loss is trouble, the recovery is only news.
-        let said = reporter.observe(&[DISCONNECTED, CONNECTED]);
+        let said = reporter.observe(&[lost(), found()]);
         assert_eq!(said.len(), 2);
         assert_eq!(said[0].level, Level::WARN);
         assert!(said[0].message.starts_with("Connection lost"));
@@ -148,12 +182,12 @@ mod tests {
 
         // Losing it again immediately is not, however many times.
         for _ in 0..50 {
-            assert!(reporter.observe(&[DISCONNECTED, CONNECTED]).is_empty());
+            assert!(reporter.observe(&[lost(), found()]).is_empty());
         }
 
         // Once the interval has passed, one report covers what it missed.
         age(&mut reporter, WARN_INTERVAL);
-        let said = reporter.observe(&[DISCONNECTED]);
+        let said = reporter.observe(&[lost()]);
         assert_eq!(said.len(), 1);
         assert!(
             said[0].message.contains("50 more went unreported"),
@@ -167,24 +201,24 @@ mod tests {
         let mut reporter = Reporter::default();
 
         // Spend the interval on a loss that is reported.
-        assert_eq!(reporter.observe(&[DISCONNECTED]).len(), 1);
-        assert_eq!(reporter.observe(&[CONNECTED]).len(), 1);
+        assert_eq!(reporter.observe(&[lost()]).len(), 1);
+        assert_eq!(reporter.observe(&[found()]).len(), 1);
 
         // The next loss is throttled away, so its recovery goes too rather
         // than arriving on its own with no loss to explain it.
-        assert!(reporter.observe(&[DISCONNECTED]).is_empty());
-        assert!(reporter.observe(&[CONNECTED]).is_empty());
+        assert!(reporter.observe(&[lost()]).is_empty());
+        assert!(reporter.observe(&[found()]).is_empty());
     }
 
     #[test]
     fn a_connection_replaced_by_hand_is_not_waiting_on_a_recovery() {
         let mut reporter = Reporter::default();
 
-        assert_eq!(reporter.observe(&[DISCONNECTED]).len(), 1);
+        assert_eq!(reporter.observe(&[lost()]).len(), 1);
         reporter.replaced();
 
         // The new connection's first CONNECTED belongs to it, not to the loss
         // the old one was in the middle of.
-        assert!(reporter.observe(&[CONNECTED]).is_empty());
+        assert!(reporter.observe(&[found()]).is_empty());
     }
 }

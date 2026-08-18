@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use omq_tokio::{
+    Context, Endpoint, Error, MonitorEvent, MonitorStream, MonitorTryRecvError,
+    Options, ReconnectPolicy, SocketType,
+};
 use std::time::{Duration, Instant};
 
 /// How long a receive waits before coming back empty
@@ -8,132 +11,121 @@ use std::time::{Duration, Instant};
 /// how [a gateway that has stopped
 /// publishing](crate::subscribe#a-gateway-that-stops-publishing) is counted
 /// out.
-pub const POLL_INTERVAL_MS: i32 = 1_000;
+pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The shortest libzmq waits before trying to rebuild [a connection that has
-/// closed](crate::subscribe#a-connection-that-closes)
+/// The shortest wait before [a connection that has
+/// closed](crate::subscribe#a-connection-that-closes) is rebuilt
 ///
 /// The wait starts here, doubles on each attempt that fails, and stops
-/// growing at [`RECONNECT_MAX_MS`]. It also starts over from here whenever a
+/// growing at [`RECONNECT_MAX`]. It also starts over from here whenever a
 /// connection is made, which is why the floor carries more weight than the
 /// ceiling: a port that accepts and then drops, a load balancer in front of a
 /// dead gateway, hands out a connection every time, so the wait is reset
-/// before it can ever grow and this alone sets the rate. At libzmq's 100ms
-/// default that is ten attempts a second for as long as the gateway is
-/// broken. At a second it is one.
-pub const RECONNECT_MIN_MS: i32 = 1_000;
+/// before it can ever grow and this alone sets the rate. At the 100ms default
+/// that is ten attempts a second for as long as the gateway is broken. At a
+/// second it is one.
+pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
 
-/// The longest libzmq waits before trying to rebuild [a connection that has
-/// closed](crate::subscribe#a-connection-that-closes)
+/// The longest wait before [a connection that has
+/// closed](crate::subscribe#a-connection-that-closes) is rebuilt
 ///
-/// Where the doubling that starts at [`RECONNECT_MIN_MS`] stops, and so the
+/// Where the doubling that starts at [`RECONNECT_MIN`] stops, and so the
 /// longest a subscriber sits there after a gateway that went away has come
 /// back.
-pub const RECONNECT_MAX_MS: i32 = 15_000;
+pub const RECONNECT_MAX: Duration = Duration::from_secs(15);
 
 /// How often to ping the gateway
 ///
 /// A ping is a write, and a write is what turns [a connection that has died
 /// without closing](crate::subscribe#a-connection-that-dies-without-closing)
-/// into something libzmq can see. With [`HEARTBEAT_TIMEOUT_MS`] this is how
+/// into something the socket can see. With [`HEARTBEAT_TIMEOUT`] this is how
 /// long that goes unnoticed, so 15 seconds.
 ///
 /// It can be this short because the answers do come. EDDN speaks ZMTP 3.1 and
 /// returns a PONG for every PING, so a connection sitting quiet is still held
 /// open by the answers to its pings, and only a broken one runs out of time.
-pub const HEARTBEAT_IVL_MS: i32 = 5_000;
+pub const HEARTBEAT_IVL: Duration = Duration::from_secs(5);
 
 /// How long to wait for anything back after a ping
 ///
-/// Nothing at all inside this and libzmq gives the connection up and builds
-/// another. Counted from a ping sent every [`HEARTBEAT_IVL_MS`], so the two
+/// Nothing arriving inside this and the connection is given up and another
+/// built. Counted from a ping sent every [`HEARTBEAT_IVL`], so the two
 /// together bound how long [a connection that has died without
 /// closing](crate::subscribe#a-connection-that-dies-without-closing) is
 /// mistaken for a quiet one.
 ///
-/// A subscriber at the receive high water mark cannot read the PONGs it is
-/// waiting for, so this expires on a live connection and the engine swap
-/// behind it aborts libzmq. [#4767] is that bug, [#4830] the fix, open since
-/// January 2026. See `ISSUE-eddn-zmq-assert.md`.
+/// It is any traffic that holds a connection open here, not a PONG in
+/// particular, so a gateway publishing steadily satisfies it without ever
+/// answering a ping.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many messages the socket holds for a subscriber that is behind
 ///
-/// [#4767]: https://github.com/zeromq/libzmq/issues/4767
-/// [#4830]: https://github.com/zeromq/libzmq/pull/4830
-pub const HEARTBEAT_TIMEOUT_MS: i32 = 10_000;
+/// The receiving thread writes each message to a database before it asks for
+/// the next, and EDDN publishes around 31 a second, so a subscriber that
+/// falls behind falls behind by a lot. What is held here is what it may catch
+/// up on; past this the connection stops being read and the gateway's own
+/// queue takes over.
+pub const RECV_HWM: u32 = 1_000;
 
-/// What to ask libzmq's socket monitor to report
+/// What a socket subscribed to EDDN is opened with
 ///
-/// [Connections that close](crate::subscribe#a-connection-that-closes) are lost and
-/// rebuilt inside libzmq, which would otherwise happen with nothing said
-/// about it.
-const MONITORED: i32 = zmq::SocketEvent::CONNECTED as i32
-    | zmq::SocketEvent::DISCONNECTED as i32
-    | zmq::SocketEvent::CONNECT_RETRIED as i32
-    | zmq::SocketEvent::HANDSHAKE_FAILED_NO_DETAIL as i32
-    | zmq::SocketEvent::HANDSHAKE_FAILED_PROTOCOL as i32
-    | zmq::SocketEvent::HANDSHAKE_FAILED_AUTH as i32;
+/// Everything the connection's health depends on is here rather than left to
+/// a default, since the defaults are for a peer on a LAN that answers.
+pub(crate) fn options() -> Options {
+    Options::new()
+        .recv_hwm(RECV_HWM)
+        .reconnect(ReconnectPolicy::Exponential {
+            min: RECONNECT_MIN,
+            max: RECONNECT_MAX,
+        })
+        .heartbeat_interval(HEARTBEAT_IVL)
+        .heartbeat_timeout(HEARTBEAT_TIMEOUT)
+}
 
-/// Names the endpoint each socket's monitor reports on.
-static MONITORS: AtomicUsize = AtomicUsize::new(0);
-
-/// A socket subscribed to EDDN, and the monitor libzmq reports on it through
+/// A socket subscribed to EDDN, and the monitor it reports on
 ///
 /// A monitor watches one socket, so the two are opened together and replaced
 /// together.
 pub(crate) struct Connection {
-    pub(crate) socket: zmq::Socket,
-    monitor: zmq::Socket,
+    pub(crate) socket: omq_tokio::blocking::Socket,
+    monitor: MonitorStream,
 }
 
 impl Connection {
     /// Open a socket subscribed to everything on `url`
     ///
     /// Connecting is asynchronous, so this returns whether or not anything is
-    /// listening, and libzmq goes on trying in the background.
-    pub(crate) fn open(
-        ctx: &zmq::Context,
-        url: &str,
-    ) -> Result<Self, zmq::Error> {
-        let socket = ctx.socket(zmq::SUB)?;
-
-        socket.set_reconnect_ivl(RECONNECT_MIN_MS)?;
-        socket.set_reconnect_ivl_max(RECONNECT_MAX_MS)?;
-
-        socket.set_heartbeat_ivl(HEARTBEAT_IVL_MS)?;
-        socket.set_heartbeat_timeout(HEARTBEAT_TIMEOUT_MS)?;
-
-        // Receives return on their own so that silence can be timed.
-        socket.set_rcvtimeo(POLL_INTERVAL_MS)?;
+    /// listening, and the socket goes on trying in the background.
+    pub(crate) fn open(ctx: &Context, url: &str) -> Result<Self, Error> {
+        let endpoint: Endpoint = url.parse()?;
+        let socket = ctx.blocking_socket(SocketType::Sub, options());
 
         // Watch before connecting, so the first connection is reported like
-        // any other. Each socket monitors on an endpoint of its own, since a
-        // replaced one may still be closing as its successor opens.
-        let endpoint = format!(
-            "inproc://eddn-monitor-{}",
-            MONITORS.fetch_add(1, Ordering::Relaxed)
-        );
-        socket.monitor(&endpoint, MONITORED)?;
-        let monitor = ctx.socket(zmq::PAIR)?;
-        monitor.connect(&endpoint)?;
+        // any other.
+        let monitor = socket.monitor();
 
-        socket.connect(url)?;
-        socket.set_subscribe(&[])?; // Required to subscribe to everything
+        socket.connect(endpoint)?;
+        socket.subscribe(&b""[..])?; // Required to subscribe to everything
 
         Ok(Connection { socket, monitor })
     }
 
-    /// What libzmq has done to this connection since it was last asked
+    /// What has happened to this connection since it was last asked
     ///
-    /// Each event arrives as its number and the endpoint it happened on. The
-    /// endpoint is the one we connected to and is dropped.
-    pub(crate) fn events(&self) -> Vec<zmq::SocketEvent> {
+    /// The monitor holds a fixed number of events and drops the oldest to
+    /// make room, so a subscriber that is behind can miss some. They are
+    /// diagnostic, and what is made of them is a count and a throttle, so
+    /// missing one costs a line rather than the truth.
+    pub(crate) fn events(&mut self) -> Vec<MonitorEvent> {
         let mut events = Vec::new();
-        while let Ok(frames) = self.monitor.recv_multipart(zmq::DONTWAIT) {
-            match frames.first() {
-                Some(frame) if frame.len() >= 2 => {
-                    let id = u16::from_le_bytes([frame[0], frame[1]]);
-                    events.push(zmq::SocketEvent::from_raw(id));
-                }
-                _ => {}
+        loop {
+            match self.monitor.try_recv() {
+                Ok(event) => events.push(event),
+                // Behind by more than the monitor holds. What was dropped
+                // cannot be reported on, and the ones still there can.
+                Err(MonitorTryRecvError::Lagged(_)) => {}
+                Err(_) => break,
             }
         }
         events
@@ -171,13 +163,6 @@ impl Stall {
 mod tests {
     use super::*;
 
-    /// A socket to read the options off. Connecting is asynchronous, so
-    /// nothing needs to be listening on the other end of this.
-    fn opened() -> Connection {
-        let ctx = zmq::Context::new();
-        Connection::open(&ctx, "tcp://127.0.0.1:9599").unwrap()
-    }
-
     /// Covers a gateway that stops publishing, which nothing else notices.
     #[test]
     fn quiet_for_longer_than_the_stall_timeout_is_an_overrun() {
@@ -197,38 +182,42 @@ mod tests {
     }
 
     /// Covers a connection that dies without closing. Only a written ping
-    /// going unanswered turns that into something libzmq can see.
+    /// going unanswered turns that into something the socket can see.
     #[test]
     fn a_connection_pings_and_gives_up_on_an_unanswered_one() {
-        let connection = opened();
-        let ivl = connection.socket.get_heartbeat_ivl().unwrap();
-        let timeout = connection.socket.get_heartbeat_timeout().unwrap();
+        let options = options();
 
-        // Zero is libzmq's default and means no pings at all, which is what
-        // left a dead connection looking like a quiet one.
-        assert_ne!(ivl, 0);
+        // Unset means no pings at all, which is what leaves a dead connection
+        // looking like a quiet one.
+        assert_eq!(options.heartbeat_interval, Some(HEARTBEAT_IVL));
 
         // Long enough to send a ping, then long enough to give up waiting on
         // an answer: the 15 seconds these two are documented to come to.
-        assert_eq!(ivl + timeout, 15_000);
+        let ivl = options.heartbeat_interval.unwrap();
+        let timeout = options.heartbeat_timeout.unwrap();
+        assert_eq!(ivl + timeout, Duration::from_secs(15));
     }
 
-    /// Covers a connection that closes, which libzmq rebuilds on its own,
-    /// and how hard it tries while the gateway is away.
+    /// Covers a connection that closes, which is rebuilt on its own, and how
+    /// hard it tries while the gateway is away.
     #[test]
     fn a_connection_retries_from_the_floor_and_no_slower_than_the_ceiling() {
-        let connection = opened();
-        let floor = connection.socket.get_reconnect_ivl().unwrap();
-        let ceiling = connection.socket.get_reconnect_ivl_max().unwrap();
-
-        // libzmq starts the doubling over on every connection made, so a port
-        // that accepts and drops never gets past the floor and the floor is
-        // the whole of the rate. Its 100ms default is ten attempts a second.
-        assert!(floor >= 1_000, "the floor is the rate, and it is {}", floor);
-        assert!(ceiling >= floor);
-
-        // Without this a receive never comes back on its own, and the quiet
-        // period above could never be measured.
-        assert_eq!(connection.socket.get_rcvtimeo(), Ok(POLL_INTERVAL_MS));
+        // The doubling starts over on every connection made, so a port that
+        // accepts and drops never gets past the floor and the floor is the
+        // whole of the rate. The 100ms default is ten attempts a second.
+        match options().reconnect {
+            ReconnectPolicy::Exponential { min, max } => {
+                assert!(
+                    min >= Duration::from_secs(1),
+                    "the floor is the rate, and it is {:?}",
+                    min
+                );
+                assert!(max >= min);
+            }
+            policy => panic!(
+                "a connection that closes wants rebuilding, and this is {:?}",
+                policy
+            ),
+        }
     }
 }

@@ -20,7 +20,7 @@ const SHOWN: usize = 2000;
 #[derive(Debug)]
 pub enum Error {
     /// The socket itself failed.
-    Socket(zmq::Error),
+    Socket(omq_tokio::Error),
     /// A message arrived that is not the zlib EDDN sends.
     Decompress(TINFLStatus),
     /// A message arrived that decompressed but is not an
