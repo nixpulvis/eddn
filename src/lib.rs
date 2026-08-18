@@ -677,9 +677,9 @@ mod tests {
 
     /// A payload that disagrees with its schema is an error, not a shrug
     ///
-    /// This is the whole difference from guessing. A journal message whose
-    /// event will not read used to be indistinguishable from a message of
-    /// some other kind, and went in the bin without a word.
+    /// This is the whole difference from guessing. The schema says what the
+    /// payload is, so a journal message whose event will not read is a
+    /// message that is wrong, not a message of some other kind.
     #[test]
     fn a_payload_that_will_not_read_is_reported() {
         let json = r#"{
@@ -836,8 +836,8 @@ mod frames {
 
     /// And one whose payload disagrees with its schema
     ///
-    /// Which used to be indistinguishable from a message of some other kind,
-    /// and went in the bin without a word.
+    /// Which the schema settles: a journal message that will not read, not a
+    /// message of some other kind.
     #[test]
     fn a_frame_whose_payload_will_not_read_is_reported() {
         let json = envelope_json(
