@@ -50,7 +50,9 @@ impl Reporter {
 
         for event in events {
             match event {
-                MonitorEvent::Disconnected { .. } if self.lost_at.is_none() => {
+                MonitorEvent::Disconnected { reason, .. }
+                    if self.lost_at.is_none() =>
+                {
                     self.lost_at = Some(Instant::now());
                     // Said once and then held back, and nothing more is said
                     // until the connection is back, however long that takes.
@@ -58,7 +60,8 @@ impl Reporter {
                     // only sign of life there will be until then.
                     self.loss_reported = self.warn(
                         &format!(
-                            "Connection lost, retrying every {} to {} seconds",
+                            "Connection lost ({:?}), retrying every {} to {} seconds",
+                            reason,
                             RECONNECT_MIN.as_secs(),
                             RECONNECT_MAX.as_secs(),
                         ),
@@ -217,8 +220,8 @@ mod tests {
         assert_eq!(reporter.observe(&[lost()]).len(), 1);
         reporter.replaced();
 
-        // The new connection's first CONNECTED belongs to it, not to the loss
-        // the old one was in the middle of.
+        // The new connection's first `Connected` belongs to it, not to the
+        // loss the old one was in the middle of.
         assert!(reporter.observe(&[found()]).is_empty());
     }
 }

@@ -301,9 +301,9 @@ impl<'a> Schema<'a> {
 /// The connection is in good health and carries nothing. Pings are answered
 /// down in the gateway's socket, which knows nothing about whether the
 /// program above it is still publishing, so heartbeats report the connection
-/// as fine and are right to. Only counting the silence finds
-/// this one, which is what `stall_timeout` counts, in the gaps a receive
-/// leaves by coming back empty every [`POLL_INTERVAL`].
+/// as fine and are right to. Only counting the silence finds this one, which
+/// is what `stall_timeout` counts, in the gaps a receive leaves by coming
+/// back empty every [`POLL_INTERVAL`].
 ///
 /// How long to give it is a question about the gateway rather than about
 /// this crate, which is why there is no default. EDDN at a busy hour carried

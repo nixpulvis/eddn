@@ -61,8 +61,10 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a socket subscribed to EDDN is opened with
 ///
-/// Everything the connection's health depends on is here rather than left to
-/// a default, since the defaults are for a peer on a LAN that answers.
+/// The reconnect and the heartbeats, whose defaults are for a peer on a LAN
+/// that answers. The handshake timeout is left at the socket's own 30
+/// seconds, which is how long a connection accepted by a middlebox and then
+/// ignored takes to give up.
 pub(crate) fn options() -> Options {
     Options::new()
         .reconnect(ReconnectPolicy::Exponential {
@@ -173,6 +175,10 @@ mod tests {
 
     /// Covers a connection that dies without closing. Only a written ping
     /// going unanswered turns that into something the socket can see.
+    ///
+    /// The values only. A socket does not answer what it was opened with, so
+    /// nothing here can tell whether [`Connection::open`] passed these on,
+    /// and `open` ignoring them altogether would leave every test green.
     #[test]
     fn a_connection_pings_and_gives_up_on_an_unanswered_one() {
         let options = options();
@@ -190,6 +196,8 @@ mod tests {
 
     /// Covers a connection that closes, which is rebuilt on its own, and how
     /// hard it tries while the gateway is away.
+    ///
+    /// The values only, as above.
     #[test]
     fn a_connection_retries_from_the_floor_and_no_slower_than_the_ceiling() {
         // The doubling starts over on every connection made, so a port that

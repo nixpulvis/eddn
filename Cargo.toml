@@ -15,6 +15,5 @@ tracing = "0.1"
 miniz_oxide = "0.4"
 omq-tokio = "0.21"
 
-
 [dev-dependencies]
 tracing-subscriber = "0.3"
