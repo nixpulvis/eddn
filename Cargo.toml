@@ -7,7 +7,7 @@ license = "Beerware"
 edition = "2018"
 
 [dependencies]
-elite_journal = "0.4"
+elite_journal = "0.5"
 serde = "1.0"
 serde_json = "1.0"
 chrono = "0.4"
