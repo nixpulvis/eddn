@@ -131,8 +131,10 @@ impl App {
         loop {
             match self.updates.try_recv() {
                 Ok(Update::Envelope(envelope)) => {
-                    self.cadence.record(Instant::now());
-                    self.feed.push(*envelope);
+                    match self.cadence.record(Instant::now()) {
+                        Some(gap) => self.feed.push_after_gap(*envelope, gap),
+                        None => self.feed.push(*envelope),
+                    }
                 }
                 Ok(Update::Error) => self.feed.note_error(),
                 Err(TryRecvError::Empty) => break,
@@ -502,17 +504,16 @@ impl App {
             // of envelopes pushed before it -- so a row keeps its identity as
             // the ring drops old ones out from under the shifting indices.
             let evicted = feed.received() - feed.retained() as u64;
-            let rows: Vec<(u64, &Envelope)> = feed
-                .rows()
-                .enumerate()
-                .filter(|(_, (envelope, search))| {
-                    view.shows(envelope.live)
-                        && (needle.is_empty() || search.contains(&needle))
-                })
-                .map(|(index, (envelope, _))| {
-                    (evicted + index as u64, envelope)
-                })
-                .collect();
+            let mut rows: Vec<(u64, &Envelope)> = Vec::new();
+            let mut gaps: Vec<Option<Duration>> = Vec::new();
+            for (index, (envelope, search, gap)) in feed.rows().enumerate() {
+                if view.shows(envelope.live)
+                    && (needle.is_empty() || search.contains(&needle))
+                {
+                    rows.push((evicted + index as u64, envelope));
+                    gaps.push(gap);
+                }
+            }
 
             // Labels are selectable by default, and the text selection senses
             // the click before the cell does, so a click on a cell's text never
@@ -564,9 +565,32 @@ impl App {
                 })
                 .body(|body| {
                     body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                        let (_, envelope) = rows[row.index()];
+                        let index = row.index();
+                        let (_, envelope) = rows[index];
+                        let gap = gaps[index];
                         for &field in &shown {
-                            row.col(|ui| field.cell(ui, envelope));
+                            row.col(|ui| {
+                                // A row that opens after a connection gap gets a
+                                // line under its time: the same stall the status
+                                // dot flags, drawn where the feed picked back up.
+                                // Painted in the time cell, in the scroll
+                                // content, so it tracks the rows rather than
+                                // lagging a frame behind as a separate layer
+                                // would.
+                                if gap.is_some() && field == Field::Time {
+                                    let rect = ui.max_rect();
+                                    let stroke = egui::Stroke::new(
+                                        2.0_f32,
+                                        ui.visuals().warn_fg_color,
+                                    );
+                                    ui.painter().hline(
+                                        rect.x_range(),
+                                        rect.top(),
+                                        stroke,
+                                    );
+                                }
+                                field.cell(ui, envelope);
+                            });
                         }
                         // The cells already sense clicks (Sense::click on the
                         // table), so the row's unioned response carries them.
@@ -576,6 +600,18 @@ impl App {
                         if response.clicked() {
                             *selected = Some(detail(envelope));
                         }
+                        let response = match gap {
+                            Some(gap) => response.on_hover_text(format!(
+                                "connection gap {}",
+                                format_span(
+                                    chrono::Duration::from_std(gap)
+                                        .unwrap_or_else(|_| {
+                                            chrono::Duration::zero()
+                                        }),
+                                ),
+                            )),
+                            None => response,
+                        };
                         response
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                     });

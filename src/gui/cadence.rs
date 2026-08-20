@@ -37,6 +37,15 @@ const INTERVAL_SAMPLES: usize = 128;
 /// burstier feeds, lower it to warn sooner.
 const STALL_SIGMAS: f64 = 4.0;
 
+/// The shortest silence that can count as a stall, whatever the statistics say
+///
+/// The outlier test degenerates when arrivals are near-metronomic: the spread
+/// collapses toward zero and the threshold falls to about the mean, so ordinary
+/// sub-second jitter reads as a stall. This floor keeps a stall a real pause,
+/// so the same test drives the status dot and the feed's gap marks without
+/// either tripping on a burst of near-simultaneous messages.
+const MIN_GAP: Duration = Duration::from_secs(1);
+
 /// The feed's arrival timing and the statistics the stall warning reads
 #[derive(Default)]
 pub struct Cadence {
@@ -52,22 +61,29 @@ pub struct Cadence {
 }
 
 impl Cadence {
-    /// Record a message arriving at `now`
+    /// Record a message arriving at `now`, returning the gap it followed when
+    /// that gap was a connection stall
     ///
     /// Files the arrival for the rate and, once there is a previous one to
     /// measure from, the gap since it for the stall statistics -- bounded to
-    /// the most recent samples so the mean and spread follow the feed's current
-    /// cadence.
-    pub fn record(&mut self, now: Instant) {
+    /// the most recent samples so the mean and spread follow the feed's
+    /// current cadence. The gap is judged against the distribution as it stood
+    /// before this arrival -- the same outlier test the status dot applies to
+    /// the ongoing silence -- and returned when it is an outlier, so a resumed
+    /// feed can be marked where it stalled.
+    pub fn record(&mut self, now: Instant) -> Option<Duration> {
         self.arrivals.push_back(now);
-        if let Some(prev) = self.last {
-            self.intervals.push_back((now - prev).as_secs_f64());
+        let gap = self.last.map(|prev| now - prev);
+        let connection_gap = gap.filter(|g| self.is_stall(g.as_secs_f64()));
+        if let Some(g) = gap {
+            self.intervals.push_back(g.as_secs_f64());
             while self.intervals.len() > INTERVAL_SAMPLES {
                 self.intervals.pop_front();
             }
         }
         self.last = Some(now);
         self.first.get_or_insert(now);
+        connection_gap
     }
 
     /// Drop arrivals that have aged out of the rate window as of `now`
@@ -100,19 +116,26 @@ impl Cadence {
         self.arrivals.len() as f64 / window
     }
 
-    /// Whether the silence since the last arrival is a statistical outlier
+    /// Whether the silence since the last arrival counts as a stall
     ///
-    /// The gap since the last message is compared to the recent inter-arrival
-    /// mean plus [`STALL_SIGMAS`] standard deviations -- a z-score outlier
-    /// test, so how far past normal counts as a stall follows the feed's own
-    /// regularity rather than a fixed number. [`false`] before any message and
-    /// until two gaps have been seen, since a spread needs two points.
+    /// The same test the feed's gap marks use, so the dot and the marks agree.
+    /// [`false`] before any message arrives; see [`Cadence::is_stall`].
     pub fn stalled(&self) -> bool {
-        let (Some(last), Some((mean, stddev))) = (self.last, self.stats())
-        else {
-            return false;
-        };
-        last.elapsed().as_secs_f64() > mean + STALL_SIGMAS * stddev
+        self.last
+            .is_some_and(|last| self.is_stall(last.elapsed().as_secs_f64()))
+    }
+
+    /// Whether a silence of `secs` counts as a stall
+    ///
+    /// At least [`MIN_GAP`] and a z-score outlier past the recent inter-arrival
+    /// distribution -- the mean plus [`STALL_SIGMAS`] standard deviations. The
+    /// floor keeps the degenerate near-zero-spread case from flagging
+    /// sub-second jitter. [`false`] until two gaps give a spread.
+    fn is_stall(&self, secs: f64) -> bool {
+        secs >= MIN_GAP.as_secs_f64()
+            && self.stats().is_some_and(|(mean, stddev)| {
+                secs > mean + STALL_SIGMAS * stddev
+            })
     }
 
     /// Mean and sample standard deviation of the recent inter-arrival gaps
@@ -231,5 +254,38 @@ mod tests {
         assert!(!Cadence::default().stalled());
         let one_gap = Cadence::from_parts([1.0], Some(Instant::now()));
         assert!(!one_gap.stalled());
+    }
+
+    #[test]
+    fn record_returns_a_gap_only_when_it_is_an_outlier() {
+        let mut cadence = Cadence::default();
+        let start = Instant::now();
+        // A steady one-second cadence: mean 1, no spread.
+        for i in 0..5u64 {
+            assert_eq!(cadence.record(start + Duration::from_secs(i)), None);
+        }
+
+        // An eleven-second jump is an outlier and comes back as the gap.
+        let resumed = start + Duration::from_secs(15);
+        assert_eq!(cadence.record(resumed), Some(Duration::from_secs(11)));
+
+        // A one-second step after it is ordinary again.
+        assert_eq!(cadence.record(resumed + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn a_sub_second_gap_is_never_a_stall() {
+        let mut cadence = Cadence::default();
+        let start = Instant::now();
+        // A fast, near-metronomic cadence: 30ms gaps, so the spread is tiny and
+        // the outlier threshold sits just above the mean.
+        for i in 0..10u64 {
+            cadence.record(start + Duration::from_millis(30 * i));
+        }
+
+        // A 300ms gap is many times the mean -- a statistical outlier -- but
+        // under the floor, so it is jitter, not a connection gap.
+        let bumped = start + Duration::from_millis(30 * 9 + 300);
+        assert_eq!(cadence.record(bumped), None);
     }
 }

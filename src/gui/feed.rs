@@ -10,6 +10,7 @@
 use eddn::{Envelope, Galaxy, Message};
 use elite_journal::entry::Event;
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::time::Duration;
 
 /// How many envelopes a [`Feed`] keeps unless told otherwise
 ///
@@ -80,6 +81,9 @@ pub struct Feed {
 struct Kept {
     envelope: Envelope,
     search: String,
+    /// The connection gap this envelope arrived after, if it followed a stall,
+    /// marking the row where the feed resumed. See [`Feed::push_after_gap`].
+    gap: Option<Duration>,
 }
 
 impl Default for Feed {
@@ -108,6 +112,16 @@ impl Feed {
 
     /// Take an envelope, dropping the oldest if the window is full
     pub fn push(&mut self, envelope: Envelope) {
+        self.push_inner(envelope, None);
+    }
+
+    /// Take an envelope that arrived after a connection gap of `gap`, marking
+    /// the row where the feed resumed after a stall
+    pub fn push_after_gap(&mut self, envelope: Envelope, gap: Duration) {
+        self.push_inner(envelope, Some(gap));
+    }
+
+    fn push_inner(&mut self, envelope: Envelope, gap: Option<Duration>) {
         self.received += 1;
         *self
             .per_schema
@@ -123,7 +137,7 @@ impl Feed {
             self.kept.pop_front();
         }
         let search = search_text(&envelope);
-        self.kept.push_back(Kept { envelope, search });
+        self.kept.push_back(Kept { envelope, search, gap });
     }
 
     /// Record the distinct systems, bodies and stations a message names
@@ -247,8 +261,12 @@ impl Feed {
     ///
     /// The search text is what [`push`](Feed::push) built once from the row's
     /// fields; a filter matches against it rather than re-reading the envelope.
-    pub fn rows(&self) -> impl Iterator<Item = (&Envelope, &str)> {
-        self.kept.iter().map(|kept| (&kept.envelope, kept.search.as_str()))
+    pub fn rows(
+        &self,
+    ) -> impl Iterator<Item = (&Envelope, &str, Option<Duration>)> {
+        self.kept
+            .iter()
+            .map(|kept| (&kept.envelope, kept.search.as_str(), kept.gap))
     }
 
     /// The largest number of envelopes the window will hold
@@ -588,6 +606,19 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_is_kept_with_the_row_that_followed_it() {
+        let mut feed = Feed::default();
+        feed.push(envelope("https://eddn.edcd.io/schemas/journal/1"));
+        feed.push_after_gap(
+            envelope("https://eddn.edcd.io/schemas/journal/1"),
+            Duration::from_secs(42),
+        );
+
+        let gaps: Vec<_> = feed.rows().map(|(_, _, gap)| gap).collect();
+        assert_eq!(gaps, vec![None, Some(Duration::from_secs(42))]);
+    }
+
+    #[test]
     fn window_duration_spans_oldest_to_newest() {
         use chrono::{Duration, TimeZone};
 
@@ -650,7 +681,7 @@ mod tests {
         env.header.uploader_id = "UploaderXYZ".to_owned();
         feed.push(env);
 
-        let (_, search) = feed.rows().next().expect("one row kept");
+        let (_, search, _) = feed.rows().next().expect("one row kept");
         assert_eq!(search, search.to_lowercase(), "search text is lowered");
         assert!(search.contains("journal"), "schema family: {search}");
         assert!(search.contains("fsdjump"), "event: {search}");
