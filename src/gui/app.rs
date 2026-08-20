@@ -133,13 +133,12 @@ impl App {
     fn drain(&mut self) {
         loop {
             match self.updates.try_recv() {
-                Ok(Update::Envelope(envelope)) => {
+                Ok(envelope) => {
                     match self.cadence.record(Instant::now()) {
                         Some(gap) => self.feed.push_after_gap(*envelope, gap),
                         None => self.feed.push(*envelope),
                     }
                 }
-                Ok(Update::Error) => self.feed.note_error(),
                 Err(TryRecvError::Empty) => break,
                 // Every sender gone means the worker thread has stopped. It only
                 // ends by unwinding, since subscribe() never returns, so the
@@ -338,9 +337,9 @@ impl App {
                 let word = ui.label(RichText::new(conn.label()).color(color));
                 dot.on_hover_text(conn.tooltip());
                 word.on_hover_text(conn.tooltip());
-                if self.feed.errors() > 0 {
+                if self.log.errors() > 0 {
                     let text =
-                        RichText::new(format!("errors {}", self.feed.errors()))
+                        RichText::new(format!("errors {}", self.log.errors()))
                             .color(ui.visuals().error_fg_color);
                     if log_link(ui, text) {
                         self.show_log = true;
@@ -450,7 +449,7 @@ impl App {
                     })
                     .inner;
                 if clear {
-                    self.feed.clear_errors();
+                    self.log.clear_errors();
                     self.log.clear_warnings();
                 }
                 egui::ScrollArea::vertical()
@@ -933,16 +932,15 @@ mod tests {
         let mut app =
             App::new(rx, LogBuffer::default(), false, DEFAULT_CAPACITY);
 
-        tx.send(Update::Envelope(Box::new(envelope(true)))).unwrap();
-        tx.send(Update::Envelope(Box::new(envelope(false)))).unwrap();
-        tx.send(Update::Error).unwrap();
+        tx.send(Box::new(envelope(true))).unwrap();
+        tx.send(Box::new(envelope(false))).unwrap();
         app.drain();
 
-        // Two envelopes counted and kept, the error counted apart, and the
-        // arrivals recorded in the cadence.
+        // Both envelopes counted and kept, and the arrivals recorded in the
+        // cadence. Unreadable messages no longer travel this channel; the log
+        // alone counts them.
         assert_eq!(app.feed.received(), 2);
         assert_eq!(app.feed.retained(), 2);
-        assert_eq!(app.feed.errors(), 1);
         assert!(app.cadence.last().is_some());
         assert!(app.cadence.rate() > 0.0);
     }
@@ -970,7 +968,7 @@ mod tests {
 
         // One message is enough to leave it: record() sets the last arrival, so
         // the connection reads live even before there are gaps to judge a stall.
-        tx.send(Update::Envelope(Box::new(envelope(true)))).unwrap();
+        tx.send(Box::new(envelope(true))).unwrap();
         app.drain();
         assert_eq!(app.connection(), Connection::Online);
     }

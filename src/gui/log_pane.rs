@@ -44,6 +44,9 @@ pub struct LogBuffer {
     /// it survives lines falling off the front; read by the status bar's
     /// warning indicator.
     warnings: Arc<AtomicUsize>,
+    /// A running count of error-level lines filed, kept apart from the ring the
+    /// same as `warnings`; read by the status bar's error indicator.
+    errors: Arc<AtomicUsize>,
 }
 
 impl LogBuffer {
@@ -63,9 +66,26 @@ impl LogBuffer {
         self.warnings.store(0, Ordering::Relaxed);
     }
 
+    /// How many error-level lines have been filed since the program started
+    pub fn errors(&self) -> usize {
+        self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Reset the error count without touching the lines, the error twin of
+    /// [`clear_warnings`](Self::clear_warnings).
+    pub fn clear_errors(&self) {
+        self.errors.store(0, Ordering::Relaxed);
+    }
+
     fn push(&self, line: LogLine) {
-        if line.level == Level::WARN {
-            self.warnings.fetch_add(1, Ordering::Relaxed);
+        match line.level {
+            Level::WARN => {
+                self.warnings.fetch_add(1, Ordering::Relaxed);
+            }
+            Level::ERROR => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
         let mut buffer = self.lines.lock();
         while buffer.len() >= CAPACITY {
@@ -146,6 +166,21 @@ mod tests {
         // Clearing dismisses the count but keeps the lines to read.
         buffer.clear_warnings();
         assert_eq!(buffer.warnings(), 0);
+        assert_eq!(buffer.snapshot().len(), 3);
+    }
+
+    #[test]
+    fn errors_count_error_lines_apart_from_warnings() {
+        let buffer = LogBuffer::default();
+        buffer.push(line(Level::WARN));
+        buffer.push(line(Level::ERROR));
+        buffer.push(line(Level::ERROR));
+        assert_eq!(buffer.errors(), 2);
+        assert_eq!(buffer.warnings(), 1);
+
+        // Clearing dismisses the count but keeps the lines to read.
+        buffer.clear_errors();
+        assert_eq!(buffer.errors(), 0);
         assert_eq!(buffer.snapshot().len(), 3);
     }
 }

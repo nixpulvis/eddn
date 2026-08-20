@@ -65,7 +65,6 @@ pub struct Feed {
     capacity: usize,
     kept: VecDeque<Kept>,
     received: u64,
-    errors: u64,
     per_schema: BTreeMap<String, u64>,
     systems: Tally<i64>,
     bodies: Tally<(i64, i16)>,
@@ -102,7 +101,6 @@ impl Feed {
             capacity,
             kept: VecDeque::new(),
             received: 0,
-            errors: 0,
             per_schema: BTreeMap::new(),
             systems: Tally::default(),
             bodies: Tally::default(),
@@ -249,14 +247,6 @@ impl Feed {
         self.stations.count(galaxy)
     }
 
-    /// Count a message that could not be read
-    ///
-    /// An error is not an envelope and is not kept, but it is part of what the
-    /// socket has done and is worth a running total of its own.
-    pub fn note_error(&mut self) {
-        self.errors += 1;
-    }
-
     /// The retained window, oldest first, each with the text it filters by
     ///
     /// The search text is what [`push`](Feed::push) built once from the row's
@@ -272,19 +262,6 @@ impl Feed {
     /// How many envelopes have ever been pushed, kept or dropped
     pub fn received(&self) -> u64 {
         self.received
-    }
-
-    /// How many unreadable messages have been counted
-    pub fn errors(&self) -> u64 {
-        self.errors
-    }
-
-    /// Reset the unreadable-message count to zero
-    ///
-    /// For the log pane's clear button, which dismisses the error and warning
-    /// counts the status bar was flagging.
-    pub fn clear_errors(&mut self) {
-        self.errors = 0;
     }
 
     /// How many envelopes the window currently holds
@@ -577,27 +554,6 @@ mod tests {
         assert_eq!(feed.retained(), 0);
         assert_eq!(feed.received(), 1);
         assert_eq!(feed.per_schema().get("commodity"), Some(&1));
-    }
-
-    #[test]
-    fn errors_are_counted_apart_from_envelopes() {
-        let mut feed = Feed::default();
-        feed.note_error();
-        feed.push(envelope("https://eddn.edcd.io/schemas/journal/1"));
-
-        assert_eq!(feed.errors(), 1);
-        assert_eq!(feed.received(), 1);
-    }
-
-    #[test]
-    fn clearing_errors_resets_the_count() {
-        let mut feed = Feed::default();
-        feed.note_error();
-        feed.note_error();
-        assert_eq!(feed.errors(), 2);
-
-        feed.clear_errors();
-        assert_eq!(feed.errors(), 0);
     }
 
     #[test]

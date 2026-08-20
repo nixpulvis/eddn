@@ -10,18 +10,13 @@ use std::thread;
 use std::time::Duration;
 use tracing::{error, warn};
 
-/// What the subscribe thread hands the UI
+/// A message off the socket, handed from the subscribe thread to the UI
 ///
-/// An envelope, or the news that one could not be read. The error's own words
-/// have already gone to the log by the time this is sent; what the UI wants
-/// from it is only that the count of unreadable messages went up.
-pub enum Update {
-    /// A message off the socket. Boxed because an envelope is large and a
-    /// channel of them should not carry the whole of one by value.
-    Envelope(Box<Envelope>),
-    /// A message that could not be read.
-    Error,
-}
+/// Boxed because an envelope is large and a channel of them should not carry
+/// the whole of one by value. Unreadable messages never travel this channel:
+/// they are logged where they are read, and the UI's error and warning counts
+/// come from that log alone.
+pub type Update = Box<Envelope>;
 
 /// Start reading `url` on a background thread
 ///
@@ -40,21 +35,26 @@ pub fn spawn(
         .spawn(move || {
             let galaxy = if include_test { Galaxy::ALL } else { Galaxy::LIVE };
             for result in subscribe(&url, stall).galaxy(galaxy) {
-                let update = match result {
-                    Ok(envelope) => Update::Envelope(Box::new(envelope)),
-                    Err(err) => {
-                        warn!(error = %err, "unreadable message");
-                        Update::Error
+                match result {
+                    Ok(envelope) => {
+                        if tx.send(Box::new(envelope)).is_err() {
+                            // The window is gone; nothing left to read for.
+                            // Return rather than break so the stream-ended
+                            // report below is reached only when subscribe()
+                            // itself stops.
+                            return;
+                        }
+                        ctx.request_repaint();
                     }
-                };
-
-                if tx.send(update).is_err() {
-                    // The window is gone; nothing left to read for. Return
-                    // rather than break so the stream-ended report below is
-                    // reached only when subscribe() itself stops.
-                    return;
+                    Err(err) => {
+                        // Logged, not sent: the log is the one source the UI's
+                        // error and warning counts read from. Repaint so the
+                        // new warning shows at once rather than at the next
+                        // periodic frame.
+                        warn!(error = %err, "unreadable message");
+                        ctx.request_repaint();
+                    }
                 }
-                ctx.request_repaint();
             }
 
             // subscribe() is documented infinite, so the loop ending is not a
