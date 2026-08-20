@@ -629,7 +629,7 @@ impl App {
                                 // content, so it tracks the rows rather than
                                 // lagging a frame behind as a separate layer
                                 // would.
-                                if gap.is_some() && field == Field::Time {
+                                if gap.is_some() && field == Field::GatewayTime {
                                     let rect = ui.max_rect();
                                     let stroke = egui::Stroke::new(
                                         2.0_f32,
@@ -695,7 +695,11 @@ struct ColumnState {
 /// of the table follows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
-    Time,
+    /// When EDDN received the message: the gateway's own timestamp.
+    GatewayTime,
+    /// When the game wrote the event: the message's own timestamp. Off by
+    /// default.
+    JournalTime,
     /// Gateway-received time less the event's own time: how long the message
     /// took to reach EDDN. Off by default.
     Delta,
@@ -712,7 +716,8 @@ impl Field {
     /// The name shown on the column's toggle
     fn label(self) -> &'static str {
         match self {
-            Field::Time => "time",
+            Field::GatewayTime => "gateway time",
+            Field::JournalTime => "journal time",
             Field::Delta => "delta",
             Field::Live => "live",
             Field::System => "system",
@@ -726,7 +731,8 @@ impl Field {
     /// How wide the column sits
     fn column(self) -> Column {
         match self {
-            Field::Time => Column::exact(160.0),
+            Field::GatewayTime => Column::exact(160.0),
+            Field::JournalTime => Column::exact(160.0),
             Field::Delta => Column::exact(70.0),
             Field::Live => Column::exact(18.0),
             Field::System => Column::initial(160.0).at_least(100.0).clip(true),
@@ -740,7 +746,8 @@ impl Field {
     /// The header's text, with a running count where the feed keeps one
     fn header(self, feed: &Feed, galaxy: Galaxy) -> String {
         match self {
-            Field::Time => "time".to_owned(),
+            Field::GatewayTime => "gateway time".to_owned(),
+            Field::JournalTime => "journal time".to_owned(),
             Field::Delta => "delta".to_owned(),
             Field::Live => String::new(),
             Field::System => {
@@ -761,11 +768,12 @@ impl Field {
     ///
     /// This is the single reading of a column, used both to fill its cell and
     /// to match the filter, so the two never drift: what the filter searches is
-    /// exactly what a column shows. [`Time`](Field::Time) and
-    /// [`Live`](Field::Live) draw themselves and carry no searchable text.
+    /// exactly what a column shows. [`GatewayTime`](Field::GatewayTime),
+    /// [`JournalTime`](Field::JournalTime) and [`Live`](Field::Live) draw
+    /// themselves and carry no searchable text.
     fn text(self, envelope: &Envelope) -> Option<String> {
         match self {
-            Field::Time | Field::Live | Field::Delta => None,
+            Field::GatewayTime | Field::JournalTime | Field::Live | Field::Delta => None,
             Field::System => Some(system_text(envelope)),
             Field::Body => envelope.body.clone(),
             Field::Station => envelope.station.clone(),
@@ -779,7 +787,7 @@ impl Field {
     /// Draw one cell of this column
     fn cell(self, ui: &mut egui::Ui, envelope: &Envelope) {
         match self {
-            Field::Time => {
+            Field::GatewayTime => {
                 ui.monospace(
                     envelope
                         .header
@@ -787,6 +795,14 @@ impl Field {
                         .format(TIMESTAMP_FORMAT)
                         .to_string(),
                 );
+            }
+            Field::JournalTime => {
+                let text = envelope
+                    .message
+                    .timestamp()
+                    .map(|event| event.format(TIMESTAMP_FORMAT).to_string())
+                    .unwrap_or_default();
+                ui.monospace(text);
             }
             Field::Delta => {
                 let text = envelope
@@ -819,14 +835,17 @@ impl Field {
     }
 }
 
-/// The feed's columns in display order, every one shown but the gateway delta
+/// The feed's columns in display order, every one shown but the journal time
+/// and the gateway delta
 ///
 /// The live/test dot is offered only when `--test` mixes the two galaxies;
 /// without it every message is live and the column would say nothing. The
-/// delta is a diagnostic most runs do not want, so it ships present but off.
+/// journal time and the delta are diagnostics most runs do not want, so they
+/// ship present but off.
 fn default_columns(test_enabled: bool) -> Vec<ColumnState> {
     let mut columns = vec![
-        ColumnState { field: Field::Time, visible: true },
+        ColumnState { field: Field::GatewayTime, visible: true },
+        ColumnState { field: Field::JournalTime, visible: false },
         ColumnState { field: Field::Delta, visible: false },
     ];
     if test_enabled {
