@@ -281,8 +281,10 @@ impl App {
                 // After the clock so the two stay lined up as the state changes.
                 let conn = self.connection();
                 let color = conn.color(ui.visuals());
-                let (rect, dot) = ui
-                    .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                let (rect, dot) = ui.allocate_exact_size(
+                    egui::vec2(10.0, 10.0),
+                    egui::Sense::hover(),
+                );
                 ui.painter().circle_filled(rect.center(), 4.0, color);
                 let word = ui.label(RichText::new(conn.label()).color(color));
                 dot.on_hover_text(conn.tooltip());
@@ -309,10 +311,22 @@ impl App {
                     ui.label(format!("span {}", format_span(span)));
                 }
                 if self.feed.errors() > 0 {
-                    ui.label(
+                    let text =
                         RichText::new(format!("errors {}", self.feed.errors()))
-                            .color(Color32::LIGHT_RED),
-                    );
+                            .color(ui.visuals().error_fg_color);
+                    if log_link(ui, text) {
+                        self.show_log = true;
+                    }
+                }
+                if self.log.warnings() > 0 {
+                    let text = RichText::new(format!(
+                        "warnings {}",
+                        self.log.warnings()
+                    ))
+                    .color(ui.visuals().warn_fg_color);
+                    if log_link(ui, text) {
+                        self.show_log = true;
+                    }
                 }
                 ui.label(format!("{:.1}/s", self.cadence.rate()));
                 ui.label(match self.cadence.last() {
@@ -365,13 +379,25 @@ impl App {
             .resizable(true)
             .default_size(140.0)
             .show_inside(ui, |ui| {
-                let close = panel_header(
-                    ui,
-                    RichText::new("log")
-                        .strong()
-                        .color(Color32::from_gray(200)),
-                    "×",
-                );
+                let (clear, close) = ui
+                    .horizontal(|ui| {
+                        ui.label(
+                            RichText::new("log")
+                                .strong()
+                                .color(Color32::from_gray(200)),
+                        );
+                        let clear = ui
+                            .button("clear counts")
+                            .on_hover_text("reset the error and warning counts")
+                            .clicked();
+                        let close = ui.button("×").clicked();
+                        (clear, close)
+                    })
+                    .inner;
+                if clear {
+                    self.feed.clear_errors();
+                    self.log.clear_warnings();
+                }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
@@ -1026,6 +1052,18 @@ fn detail(envelope: &Envelope) -> String {
         }
     }
     text
+}
+
+/// A status-bar count, coloured by its severity, that opens the log on click
+///
+/// Errors and warnings both lead only to the log -- their details never go
+/// anywhere else -- so the count is the way in rather than a dead end. Returns
+/// whether it was clicked.
+fn log_link(ui: &mut egui::Ui, text: RichText) -> bool {
+    ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("open the log")
+        .clicked()
 }
 
 /// A compact rendering of how long the retained window spans, e.g. `2m41s`

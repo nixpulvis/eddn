@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::fmt::{Debug, Write as _};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -37,16 +38,36 @@ pub struct LogLine {
 /// Cloned between the tracing layer that fills it and the app that reads it, so
 /// both hold the one buffer.
 #[derive(Clone, Default)]
-pub struct LogBuffer(Arc<Mutex<VecDeque<LogLine>>>);
+pub struct LogBuffer {
+    lines: Arc<Mutex<VecDeque<LogLine>>>,
+    /// A running count of warn-level lines filed. Kept apart from the ring so
+    /// it survives lines falling off the front; read by the status bar's
+    /// warning indicator.
+    warnings: Arc<AtomicUsize>,
+}
 
 impl LogBuffer {
     /// A copy of every line currently held, oldest first
     pub fn snapshot(&self) -> Vec<LogLine> {
-        self.0.lock().iter().cloned().collect()
+        self.lines.lock().iter().cloned().collect()
+    }
+
+    /// How many warn-level lines have been filed since the program started
+    pub fn warnings(&self) -> usize {
+        self.warnings.load(Ordering::Relaxed)
+    }
+
+    /// Reset the warning count without touching the lines, for the pane's
+    /// clear button: the history stays readable, only the badge is dismissed.
+    pub fn clear_warnings(&self) {
+        self.warnings.store(0, Ordering::Relaxed);
     }
 
     fn push(&self, line: LogLine) {
-        let mut buffer = self.0.lock();
+        if line.level == Level::WARN {
+            self.warnings.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut buffer = self.lines.lock();
         while buffer.len() >= CAPACITY {
             buffer.pop_front();
         }
@@ -98,5 +119,33 @@ impl<S: Subscriber> Layer<S> for LogLayer {
             message: format!("{}{}", visitor.message, visitor.fields),
             at: Utc::now(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(level: Level) -> LogLine {
+        LogLine {
+            level,
+            target: "test".to_owned(),
+            message: String::new(),
+            at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn warnings_count_warn_lines_and_clear_leaves_the_history() {
+        let buffer = LogBuffer::default();
+        buffer.push(line(Level::INFO));
+        buffer.push(line(Level::WARN));
+        buffer.push(line(Level::WARN));
+        assert_eq!(buffer.warnings(), 2);
+
+        // Clearing dismisses the count but keeps the lines to read.
+        buffer.clear_warnings();
+        assert_eq!(buffer.warnings(), 0);
+        assert_eq!(buffer.snapshot().len(), 3);
     }
 }

@@ -125,12 +125,9 @@ impl Cadence {
             return None;
         }
         let mean = self.intervals.iter().sum::<f64>() / n as f64;
-        let variance = self
-            .intervals
-            .iter()
-            .map(|gap| (gap - mean).powi(2))
-            .sum::<f64>()
-            / (n as f64 - 1.0);
+        let variance =
+            self.intervals.iter().map(|gap| (gap - mean).powi(2)).sum::<f64>()
+                / (n as f64 - 1.0);
         Some((mean, variance.sqrt()))
     }
 }

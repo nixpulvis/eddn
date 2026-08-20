@@ -266,6 +266,14 @@ impl Feed {
         self.errors
     }
 
+    /// Reset the unreadable-message count to zero
+    ///
+    /// For the log pane's clear button, which dismisses the error and warning
+    /// counts the status bar was flagging.
+    pub fn clear_errors(&mut self) {
+        self.errors = 0;
+    }
+
     /// How many envelopes the window currently holds
     pub fn retained(&self) -> usize {
         self.kept.len()
@@ -566,6 +574,17 @@ mod tests {
 
         assert_eq!(feed.errors(), 1);
         assert_eq!(feed.received(), 1);
+    }
+
+    #[test]
+    fn clearing_errors_resets_the_count() {
+        let mut feed = Feed::default();
+        feed.note_error();
+        feed.note_error();
+        assert_eq!(feed.errors(), 2);
+
+        feed.clear_errors();
+        assert_eq!(feed.errors(), 0);
     }
 
     #[test]
