@@ -380,15 +380,6 @@ impl App {
                 if let Some(span) = self.feed.window_duration() {
                     ui.label(format!("span {}", format_span(span)));
                 }
-                let received = self.feed.received();
-                let saved = if received == 0 {
-                    100.0
-                } else {
-                    100.0 * self.feed.retained() as f64 / received as f64
-                };
-                ui.label(format!("saved {saved:.1}%")).on_hover_text(
-                    "share of received messages still in the window",
-                );
                 ui.separator();
                 if ui.button("follow").clicked() {
                     self.follow_latest = true;
