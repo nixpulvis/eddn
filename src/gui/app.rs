@@ -1,0 +1,1000 @@
+//! The window: a list of what has come off the socket, a look at any one of
+//! it, the crate's log, and a line of totals across the top.
+
+use crate::feed::{event_label, schema_family, system_text, Feed};
+use crate::log_pane::{LogBuffer, LogLine};
+use crate::worker::Update;
+use chrono::Utc;
+use eddn::{Envelope, Galaxy, Message};
+use egui::{Color32, RichText};
+use egui_extras::{Column, TableBuilder};
+use serde_json::to_string_pretty;
+use std::collections::VecDeque;
+use std::fmt::Write as _;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+use tracing::Level;
+
+/// How long an arrival counts toward the rate shown
+const RATE_WINDOW: Duration = Duration::from_secs(5);
+
+/// The shortest span the rate is averaged over
+///
+/// Until [`RATE_WINDOW`] of history exists the rate is averaged over how long
+/// the feed has actually been running, which starts near zero. This floors that
+/// span at one second: the reading fills smoothly from zero to the true rate
+/// over the first second rather than dividing a message or two by almost
+/// nothing and jumping around before it settles.
+const RATE_WINDOW_MIN: Duration = Duration::from_secs(1);
+
+/// One line's height in the feed list, for the scroll area's row maths
+const ROW_HEIGHT: f32 = 18.0;
+
+/// How a UTC timestamp is spelled wherever the window shows one: the live
+/// clock and every row's gateway time, so the two read the same and line up.
+const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%SZ";
+
+/// The window's state: everything a frame draws from and remembers between them.
+pub struct App {
+    feed: Feed,
+    updates: Receiver<Update>,
+    log: LogBuffer,
+
+    /// Substring matched against a row's schema, event, system, body, station
+    /// and uploader; independent of which columns are shown.
+    filter: String,
+    /// Whether test data is enabled (the `--test` flag): the subscription
+    /// carries both galaxies, the live column and the live/test filters show,
+    /// and non-live events appear. Without it only live events arrive.
+    test_enabled: bool,
+    /// Which galaxy's rows to show. Only meaningful when `test_enabled`: the
+    /// subscription carries both galaxies under `--test`, and this filters the
+    /// view of them down to the live galaxy, the test one, or both. Starts on
+    /// the test galaxy under `--test`, since watching test data is the reason
+    /// to have asked for it; [`ALL`](Galaxy::ALL) otherwise, where every row is
+    /// live anyway.
+    view: Galaxy,
+    /// The rendered detail of whatever row was last clicked.
+    selected: Option<String>,
+    /// The table's columns in display order, each with whether it is shown.
+    /// Any of them can be toggled from the status bar.
+    columns: Vec<ColumnState>,
+
+    /// Whether the log pane is shown. Hidden by default; opened from the
+    /// status bar button and closed from the pane's own header.
+    show_log: bool,
+
+    /// Set when the follow button is pressed, to scroll back to the newest row
+    /// and resume tailing. Consumed the frame it is read.
+    follow_latest: bool,
+
+    /// While scrolled up from the live edge, the top-of-view message by
+    /// sequence number and the pixels it sits scrolled past
+    ///
+    /// The one piece of scroll state that has to outlive a frame. egui keeps
+    /// the raw pixel offset itself, but the feed is a ring: once full, each
+    /// arrival drops the oldest and every row index shifts down one, so that
+    /// raw offset slides the view over the messages. A sequence number
+    /// survives eviction where a row index does not, so the top message is
+    /// remembered by its sequence and the offset re-derived each frame from
+    /// where it now sits. The re-derivation is cheap (see
+    /// [`anchor_offset`]/[`top_anchor`]); it is stored rather than recomputed
+    /// only because nothing in the fresh frame remembers the pre-eviction
+    /// layout. [`None`] while tailing the bottom, where sticking to the bottom
+    /// already follows the newest row.
+    feed_anchor: Option<(u64, f32)>,
+
+    /// When each of the last [`RATE_WINDOW`] of arrivals came in.
+    arrivals: VecDeque<Instant>,
+    /// When the most recent message arrived, for the age shown.
+    last_arrival: Option<Instant>,
+    /// When the first message ever arrived, for scaling the rate window.
+    first_arrival: Option<Instant>,
+
+    /// The frame the feed and log were last taken in
+    ///
+    /// egui may run [`ui`](eframe::App::ui) more than once a frame to settle a
+    /// layout, and taking new messages on the second pass would move rows out
+    /// from under the widget ids assigned on the first. So the channel and the
+    /// log are read once a frame, and the passes of that frame all draw the
+    /// same thing.
+    last_frame: Option<u64>,
+    /// The log as it stood when this frame began.
+    log_lines: Vec<LogLine>,
+
+    /// The detail panel's opening width, measured once and kept
+    ///
+    /// It is the width of the widest fixed line laid out in the monospace
+    /// font, which does not change under us, so it is worth laying out once
+    /// rather than every frame the panel is open. [`None`] until first needed.
+    detail_width: Option<f32>,
+}
+
+impl App {
+    /// Build the app around the worker's channel and the shared log buffer.
+    pub fn new(
+        updates: Receiver<Update>,
+        log: LogBuffer,
+        test_enabled: bool,
+    ) -> Self {
+        App {
+            feed: Feed::default(),
+            updates,
+            log,
+            filter: String::new(),
+            test_enabled,
+            view: if test_enabled { Galaxy::TEST } else { Galaxy::ALL },
+            selected: None,
+            columns: default_columns(test_enabled),
+            show_log: false,
+            follow_latest: false,
+            feed_anchor: None,
+            arrivals: VecDeque::new(),
+            last_arrival: None,
+            first_arrival: None,
+            last_frame: None,
+            log_lines: Vec::new(),
+            detail_width: None,
+        }
+    }
+
+    /// Take everything the worker has handed over since the last frame
+    fn drain(&mut self) {
+        while let Ok(update) = self.updates.try_recv() {
+            match update {
+                Update::Envelope(envelope) => {
+                    let now = Instant::now();
+                    self.arrivals.push_back(now);
+                    self.last_arrival = Some(now);
+                    self.first_arrival.get_or_insert(now);
+                    self.feed.push(*envelope);
+                }
+                Update::Error => self.feed.note_error(),
+            }
+        }
+
+        let cutoff = Instant::now() - RATE_WINDOW;
+        while self.arrivals.front().is_some_and(|at| *at < cutoff) {
+            self.arrivals.pop_front();
+        }
+    }
+
+    /// Messages a second
+    ///
+    /// Averaged over how long the feed has been running, growing from the first
+    /// message until it reaches [`RATE_WINDOW`]. Dividing by the full window
+    /// before that much history exists understates the rate at startup.
+    fn rate(&self) -> f64 {
+        let Some(first) = self.first_arrival else {
+            return 0.0;
+        };
+        let window =
+            first.elapsed().clamp(RATE_WINDOW_MIN, RATE_WINDOW).as_secs_f64();
+        self.arrivals.len() as f64 / window
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Read the socket and the log once a frame, not once a pass, so a
+        // second layout pass draws the same rows the first laid out.
+        let frame_nr = ui.ctx().cumulative_frame_nr();
+        if self.last_frame != Some(frame_nr) {
+            self.last_frame = Some(frame_nr);
+            self.drain();
+            // Only when the pane is shown: a hidden log needs no copy, and
+            // this runs every frame, at least once a second while idle.
+            self.log_lines =
+                if self.show_log { self.log.snapshot() } else { Vec::new() };
+            // Clear the follow request once a frame, not once a pass. A pass
+            // that consumed it can be discarded by egui's multi-pass layout,
+            // which throws away its scroll_to_row but not this write -- so the
+            // re-run pass would scroll nowhere. Held across the frame's passes,
+            // it is applied on whichever one is kept, then cleared next frame.
+            self.follow_latest = false;
+        }
+        // Keep the age and rate honest while no messages arrive to repaint us.
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+
+        // Scroll instantly rather than animating. The follow button jumps to
+        // the newest row, and a smooth scroll never lands there because new
+        // rows keep extending the bottom past a moving target. Set every frame
+        // because eframe rebuilds the style after startup.
+        //
+        // The same call silences egui's debug-only "widget id changed between
+        // passes" lint: egui_extras keys each cell by its virtualized row index
+        // and relays a different row window across its own two-pass layout, so
+        // the id under a fixed rect shifts and the lint fires once per cell. We
+        // cannot pin it from outside the widget (no per-row id API); it is
+        // harmless (clicks resolve within a frame) and absent from release.
+        //
+        // TODO: upstream -- egui_extras should keep cell ids stable across its
+        // own multi-pass layout, or expose a per-row id salt. Track/file at
+        // https://github.com/emilk/egui/issues
+        ui.ctx().all_styles_mut(|style| {
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+            #[cfg(debug_assertions)]
+            {
+                style.debug.warn_if_rect_changes_id = false;
+            }
+        });
+
+        self.status_bar(ui);
+        self.log_panel(ui);
+        self.detail_panel(ui);
+        self.feed_list(ui);
+    }
+}
+
+impl App {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("status").show_inside(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                // The wall clock, UTC to match the gateway timestamps in the
+                // feed's time column, so how current the feed is reads at a
+                // glance. The frame already repaints once a second (see `ui`),
+                // so it ticks without any clock of its own.
+                ui.monospace(Utc::now().format(TIMESTAMP_FORMAT).to_string());
+                ui.separator();
+                let received =
+                    ui.label(format!("received {}", self.feed.received()));
+                if !self.feed.per_schema().is_empty() {
+                    received.on_hover_ui(|ui| {
+                        for (family, count) in self.feed.per_schema() {
+                            ui.label(
+                                RichText::new(format!("{count:>6}  {family}"))
+                                    .monospace(),
+                            );
+                        }
+                    });
+                }
+                ui.label(format!(
+                    "kept {}/{}",
+                    self.feed.retained(),
+                    self.feed.capacity()
+                ));
+                if let Some(span) = self.feed.window_duration() {
+                    ui.label(format!("span {}", format_span(span)));
+                }
+                if self.feed.errors() > 0 {
+                    ui.label(
+                        RichText::new(format!("errors {}", self.feed.errors()))
+                            .color(Color32::LIGHT_RED),
+                    );
+                }
+                ui.label(format!("{:.1}/s", self.rate()));
+                ui.label(match self.last_arrival {
+                    Some(at) => {
+                        format!("last {:.0}s ago", at.elapsed().as_secs_f64())
+                    }
+                    None => "waiting...".to_owned(),
+                });
+                ui.separator();
+                if ui.button("follow").clicked() {
+                    self.follow_latest = true;
+                }
+                if ui.button("log").clicked() {
+                    self.show_log = !self.show_log;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("filter");
+                ui.text_edit_singleline(&mut self.filter);
+                if self.test_enabled {
+                    ui.separator();
+                    ui.label("show:");
+                    ui.selectable_value(&mut self.view, Galaxy::LIVE, "live");
+                    ui.selectable_value(&mut self.view, Galaxy::TEST, "test");
+                    ui.selectable_value(&mut self.view, Galaxy::ALL, "both");
+                }
+                ui.separator();
+                for column in &mut self.columns {
+                    let label = column.field.label();
+                    ui.checkbox(&mut column.visible, label);
+                }
+            });
+            // A little breathing room before the feed table butts up below.
+            ui.add_space(ui.spacing().item_spacing.y);
+        });
+    }
+
+    fn log_panel(&mut self, ui: &mut egui::Ui) {
+        // Hidden until asked for from the status bar: the feed is the point,
+        // and the log is there for when a connection needs looking into.
+        if !self.show_log {
+            return;
+        }
+        // A dark background sets the log apart from the feed above it.
+        let frame = egui::Frame::side_top_panel(ui.style())
+            .fill(Color32::from_gray(12));
+        egui::Panel::bottom("log")
+            .frame(frame)
+            .resizable(true)
+            .default_size(140.0)
+            .show_inside(ui, |ui| {
+                let close = panel_header(
+                    ui,
+                    RichText::new("log")
+                        .strong()
+                        .color(Color32::from_gray(200)),
+                    "×",
+                );
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.log_lines {
+                            let color = level_color(line.level);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}  {:>5}  {}  {}",
+                                    line.at.format("%H:%M:%SZ"),
+                                    line.level,
+                                    line.target,
+                                    line.message,
+                                ))
+                                .monospace()
+                                .color(color),
+                            );
+                        }
+                    });
+                if close {
+                    self.show_log = false;
+                }
+            });
+    }
+
+    fn detail_panel(&mut self, ui: &mut egui::Ui) {
+        // Closed until a row is clicked, and closable from its header.
+        if self.selected.is_none() {
+            return;
+        }
+        // Open just wide enough for the widest fixed line -- the 64-hex
+        // uploader id -- so it reads without wrapping or a scrollbar. Measured
+        // in the detail's own monospace font, plus the vertical scrollbar and a
+        // little margin; the divider is draggable and remembered after that.
+        // Laid out once and kept: the font and spacing do not change under us.
+        let default_width = *self.detail_width.get_or_insert_with(|| {
+            let sample = "uploader: \
+                0000000000000000000000000000000000000000000000000000000000000000";
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
+            let text_width = ui.ctx().fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(sample.to_owned(), font, Color32::PLACEHOLDER)
+                    .rect
+                    .width()
+            });
+            let frame = egui::Frame::side_top_panel(ui.style());
+            text_width
+                + frame.inner_margin.sum().x
+                + ui.spacing().scroll.bar_width
+                + ui.spacing().item_spacing.x
+        });
+        egui::Panel::right("detail")
+            .resizable(true)
+            .default_size(default_width)
+            .show_inside(ui, |ui| {
+                let close =
+                    panel_header(ui, RichText::new("detail").strong(), "close");
+                if let Some(text) = &self.selected {
+                    egui::ScrollArea::both().auto_shrink([false, false]).show(
+                        ui,
+                        |ui| {
+                            ui.label(RichText::new(text).monospace());
+                        },
+                    );
+                }
+                if close {
+                    self.selected = None;
+                }
+            });
+    }
+
+    fn feed_list(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            // Disjoint field borrows: the filtered view borrows the feed and
+            // the columns while clicks write the selection, and the three are
+            // different fields.
+            let feed = &self.feed;
+            let selected = &mut self.selected;
+            let filter = &self.filter;
+            let columns = &self.columns;
+            let feed_anchor = &mut self.feed_anchor;
+            let view = self.view;
+            let follow = self.follow_latest;
+
+            // The columns actually drawn. The table, its header and its rows
+            // are all built by walking this one list, so they never fall out
+            // of step however the toggles leave it.
+            let shown: Vec<Field> = columns
+                .iter()
+                .filter(|column| column.visible)
+                .map(|column| column.field)
+                .collect();
+            // Every column hidden: an empty table leaves egui_extras with
+            // nothing to lay out, so say as much and stop.
+            if shown.is_empty() {
+                ui.weak("all columns hidden");
+                return;
+            }
+
+            let needle = filter.to_lowercase();
+            // Each row carries the sequence number of its envelope -- the count
+            // of envelopes pushed before it -- so a row keeps its identity as
+            // the ring drops old ones out from under the shifting indices.
+            let evicted = feed.received() - feed.retained() as u64;
+            let rows: Vec<(u64, &Envelope)> = feed
+                .rows()
+                .enumerate()
+                .filter(|(_, (envelope, search))| {
+                    view.shows(envelope.live)
+                        && (needle.is_empty() || search.contains(&needle))
+                })
+                .map(|(index, (envelope, _))| {
+                    (evicted + index as u64, envelope)
+                })
+                .collect();
+
+            // Labels are selectable by default, and the text selection senses
+            // the click before the cell does, so a click on a cell's text never
+            // reaches the row. The feed is for reading and clicking, not
+            // selecting text, so turn it off for this table.
+            ui.style_mut().interaction.selectable_labels = false;
+
+            // The pitch egui_extras scrolls by: a row plus the gap under it.
+            let pitch = ROW_HEIGHT + ui.spacing().item_spacing.y;
+
+            let mut table = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                // Tail the feed: newest at the bottom, following new messages
+                // while at the live edge.
+                .stick_to_bottom(true)
+                // The feed is clicked, not dragged. With drag-to-scroll on, a
+                // click that shifts a pixel is read as a scroll: the view moves
+                // and the anchor that holds it still is lost, so a click near
+                // the live edge drops out of follow. Off, a click stays a click.
+                .drag_to_scroll(false)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for &field in &shown {
+                table = table.column(field.column());
+            }
+            if follow {
+                // Scroll animation is off (set in `ui`), so this jumps straight
+                // to the newest row; stick_to_bottom then keeps tailing.
+                table = table.scroll_to_row(
+                    rows.len().saturating_sub(1),
+                    Some(egui::Align::BOTTOM),
+                );
+            } else if let Some((anchor, frac)) = *feed_anchor {
+                // Scrolled up: hold the remembered message where it was, so
+                // eviction cannot slide the view over the feed.
+                table = table.vertical_scroll_offset(anchor_offset(
+                    &rows, anchor, frac, pitch,
+                ));
+            }
+
+            let output = table
+                .header(20.0, |mut header| {
+                    for &field in &shown {
+                        header.col(|ui| {
+                            ui.strong(field.header(feed, view));
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                        let (_, envelope) = rows[row.index()];
+                        for &field in &shown {
+                            row.col(|ui| field.cell(ui, envelope));
+                        }
+                        // The cells already sense clicks (Sense::click on the
+                        // table), so the row's unioned response carries them.
+                        // `interact` would reuse that response's id at the full
+                        // row rect and clash, drawing egui's id-clash overlay.
+                        let response = row.response();
+                        if response.clicked() {
+                            *selected = Some(detail(envelope));
+                        }
+                        response
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    });
+                });
+
+            // Remember which message is at the top and how far past it the view
+            // sits, for the next frame to re-anchor to. None at the bottom,
+            // where sticking to the bottom already follows the newest row.
+            let settled = output.state.offset.y;
+            let max_offset =
+                (output.content_size.y - output.inner_rect.height()).max(0.0);
+            *feed_anchor = top_anchor(&rows, settled, max_offset, pitch);
+        });
+    }
+}
+
+/// A feed column and whether it is currently shown
+struct ColumnState {
+    field: Field,
+    visible: bool,
+}
+
+/// One column of the feed table
+///
+/// A column's name, width, header and cell all live on the one value rather
+/// than spread through [`feed_list`](App::feed_list): the table is built, its
+/// header laid out, its cells filled and the filter matched by walking the same
+/// set, so a column is added, dropped or reordered in one place and every part
+/// of the table follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Time,
+    /// Gateway-received time less the event's own time: how long the message
+    /// took to reach EDDN. Off by default.
+    Delta,
+    /// The live/test dot; offered only when `--test` mixes the two galaxies.
+    Live,
+    System,
+    Body,
+    Station,
+    Schema,
+    Event,
+}
+
+impl Field {
+    /// The name shown on the column's toggle
+    fn label(self) -> &'static str {
+        match self {
+            Field::Time => "time",
+            Field::Delta => "delta",
+            Field::Live => "live",
+            Field::System => "system",
+            Field::Body => "body",
+            Field::Station => "station",
+            Field::Schema => "schema",
+            Field::Event => "event",
+        }
+    }
+
+    /// How wide the column sits
+    fn column(self) -> Column {
+        match self {
+            Field::Time => Column::exact(160.0),
+            Field::Delta => Column::exact(70.0),
+            Field::Live => Column::exact(18.0),
+            Field::System => Column::initial(160.0).at_least(100.0).clip(true),
+            Field::Body => Column::initial(150.0).at_least(90.0).clip(true),
+            Field::Station => Column::initial(150.0).at_least(90.0).clip(true),
+            Field::Schema => Column::initial(130.0).at_least(90.0),
+            Field::Event => Column::initial(200.0).at_least(150.0).clip(true),
+        }
+    }
+
+    /// The header's text, with a running count where the feed keeps one
+    fn header(self, feed: &Feed, galaxy: Galaxy) -> String {
+        match self {
+            Field::Time => "time".to_owned(),
+            Field::Delta => "delta".to_owned(),
+            Field::Live => String::new(),
+            Field::System => {
+                format!("systems ({})", feed.systems(galaxy))
+            }
+            Field::Body => {
+                format!("bodies ({})", feed.bodies(galaxy))
+            }
+            Field::Station => {
+                format!("stations ({})", feed.stations(galaxy))
+            }
+            Field::Schema => "schema".to_owned(),
+            Field::Event => "event".to_owned(),
+        }
+    }
+
+    /// The cell's text, or `None` for a column that paints itself
+    ///
+    /// This is the single reading of a column, used both to fill its cell and
+    /// to match the filter, so the two never drift: what the filter searches is
+    /// exactly what a column shows. [`Time`](Field::Time) and
+    /// [`Live`](Field::Live) draw themselves and carry no searchable text.
+    fn text(self, envelope: &Envelope) -> Option<String> {
+        match self {
+            Field::Time | Field::Live | Field::Delta => None,
+            Field::System => Some(system_text(envelope)),
+            Field::Body => envelope.body.clone(),
+            Field::Station => envelope.station.clone(),
+            Field::Schema => {
+                Some(schema_family(&envelope.schema_ref).to_owned())
+            }
+            Field::Event => Some(event_label(&envelope.message)),
+        }
+    }
+
+    /// Draw one cell of this column
+    fn cell(self, ui: &mut egui::Ui, envelope: &Envelope) {
+        match self {
+            Field::Time => {
+                ui.monospace(
+                    envelope
+                        .header
+                        .gateway_timestamp
+                        .format(TIMESTAMP_FORMAT)
+                        .to_string(),
+                );
+            }
+            Field::Delta => {
+                let text = envelope
+                    .message
+                    .timestamp()
+                    .map(|event| {
+                        format_delta(envelope.header.gateway_timestamp - event)
+                    })
+                    .unwrap_or_default();
+                ui.monospace(text);
+            }
+            Field::Live => {
+                // A filled dot painted rather than a glyph, so it renders the
+                // same whatever the font has.
+                let color = if envelope.live {
+                    Color32::LIGHT_GREEN
+                } else {
+                    Color32::DARK_GRAY
+                };
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ROW_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                ui.painter().circle_filled(rect.center(), 4.0, color);
+            }
+            _ => {
+                ui.label(self.text(envelope).unwrap_or_default());
+            }
+        }
+    }
+}
+
+/// The feed's columns in display order, every one shown but the gateway delta
+///
+/// The live/test dot is offered only when `--test` mixes the two galaxies;
+/// without it every message is live and the column would say nothing. The
+/// delta is a diagnostic most runs do not want, so it ships present but off.
+fn default_columns(test_enabled: bool) -> Vec<ColumnState> {
+    let mut columns = vec![
+        ColumnState { field: Field::Time, visible: true },
+        ColumnState { field: Field::Delta, visible: false },
+    ];
+    if test_enabled {
+        columns.push(ColumnState { field: Field::Live, visible: true });
+    }
+    columns.extend(
+        [
+            Field::Schema,
+            Field::Event,
+            Field::System,
+            Field::Body,
+            Field::Station,
+        ]
+        .map(|field| ColumnState { field, visible: true }),
+    );
+    columns
+}
+
+/// The scroll offset that puts the message `anchor` back at the top of the
+/// view, `frac` pixels above its first line
+///
+/// The rows are newest-last and their sequence numbers only climb, so the
+/// anchored message sits at the first row whose sequence has caught up to it.
+/// A message already evicted has no row and lands at the top, which is where
+/// reading the oldest kept message leaves you anyway.
+fn anchor_offset<T>(
+    rows: &[(u64, T)],
+    anchor: u64,
+    frac: f32,
+    pitch: f32,
+) -> f32 {
+    let top = rows.partition_point(|(seq, _)| *seq < anchor);
+    top as f32 * pitch + frac
+}
+
+/// The message at the top of a view scrolled to `settled`, and the pixels it
+/// sits past, or [`None`] when the view is at the bottom
+///
+/// At the bottom there is nothing to anchor: sticking to the bottom already
+/// follows the newest row, and anchoring would fight it. `max_offset` is the
+/// furthest the view can scroll, so the last pixel counts as the bottom within
+/// the rounding a row's height allows.
+fn top_anchor<T>(
+    rows: &[(u64, T)],
+    settled: f32,
+    max_offset: f32,
+    pitch: f32,
+) -> Option<(u64, f32)> {
+    if rows.is_empty() || settled >= max_offset - 1.0 {
+        return None;
+    }
+    let top = ((settled / pitch).floor() as usize).min(rows.len() - 1);
+    Some((rows[top].0, settled - top as f32 * pitch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_pane::LogBuffer;
+    use chrono::Utc;
+    use eddn::Header;
+    use serde_json::{from_value, json};
+    use std::sync::mpsc;
+
+    fn envelope(live: bool) -> Envelope {
+        Envelope {
+            schema_ref: "https://eddn.edcd.io/schemas/journal/1".to_owned(),
+            header: Header {
+                gateway_timestamp: Utc::now(),
+                software_name: "test".to_owned(),
+                software_version: "0".to_owned(),
+                uploader_id: "cmdr".to_owned(),
+            },
+            message: Message::Unmodeled(json!({})),
+            live,
+            version: None,
+            star_system: None,
+            station: None,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn test_mode_starts_on_the_test_galaxy() {
+        // --test is asked for to watch test data, so that is what shows first.
+        let (_tx, rx) = mpsc::channel();
+        let app = App::new(rx, LogBuffer::default(), true);
+        assert_eq!(app.view, Galaxy::TEST);
+    }
+
+    #[test]
+    fn without_test_mode_every_row_shows() {
+        // Only live events arrive, so the galaxy filter admits all of them.
+        let (_tx, rx) = mpsc::channel();
+        let app = App::new(rx, LogBuffer::default(), false);
+        assert_eq!(app.view, Galaxy::ALL);
+    }
+
+    #[test]
+    fn drain_moves_updates_into_the_feed() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(rx, LogBuffer::default(), false);
+
+        tx.send(Update::Envelope(Box::new(envelope(true)))).unwrap();
+        tx.send(Update::Envelope(Box::new(envelope(false)))).unwrap();
+        tx.send(Update::Error).unwrap();
+        app.drain();
+
+        // Two envelopes counted and kept, the error counted apart, and the
+        // rate window and age both moved by the arrivals.
+        assert_eq!(app.feed.received(), 2);
+        assert_eq!(app.feed.retained(), 2);
+        assert_eq!(app.feed.errors(), 1);
+        assert_eq!(app.arrivals.len(), 2);
+        assert!(app.last_arrival.is_some());
+        assert!(app.first_arrival.is_some());
+    }
+
+    #[test]
+    fn rate_scales_until_the_window_saturates() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = App::new(rx, LogBuffer::default(), false);
+        let now = Instant::now();
+        for _ in 0..30 {
+            app.arrivals.push_back(now);
+        }
+
+        // ~1s into the feed: averaged over the second actually observed, not the
+        // full window, so 30 messages read as ~30/s rather than 30/5 = 6/s.
+        app.first_arrival = Some(now - Duration::from_secs(1));
+        let ramping = app.rate();
+        assert!((25.0..=31.0).contains(&ramping), "ramping rate was {ramping}");
+
+        // Past RATE_WINDOW: averaged over the full window, so 30 / 5 = 6/s.
+        app.first_arrival = Some(now - Duration::from_secs(30));
+        let saturated = app.rate();
+        assert!(
+            (5.5..=6.5).contains(&saturated),
+            "saturated rate was {saturated}"
+        );
+    }
+
+    #[test]
+    fn nav_route_system_shows_endpoints() {
+        use eddn::Header;
+        use elite_journal::entry::{Entry, Event};
+
+        let entry: Entry<Event> = from_value(json!({
+            "timestamp": "2020-01-01T00:00:00Z",
+            "event": "NavRoute",
+            "Route": [
+                {"StarSystem": "Sol", "SystemAddress": 1,
+                 "StarPos": [0.0, 0.0, 0.0], "StarClass": "G"},
+                {"StarSystem": "Wolf 359", "SystemAddress": 2,
+                 "StarPos": [1.0, 1.0, 1.0], "StarClass": "M"},
+                {"StarSystem": "Sirius", "SystemAddress": 3,
+                 "StarPos": [2.0, 2.0, 2.0], "StarClass": "A"}
+            ]
+        }))
+        .unwrap();
+        let envelope = Envelope {
+            schema_ref: "https://eddn.edcd.io/schemas/navroute/1".to_owned(),
+            header: Header {
+                gateway_timestamp: Utc::now(),
+                software_name: "t".to_owned(),
+                software_version: "0".to_owned(),
+                uploader_id: "u".to_owned(),
+            },
+            message: Message::Journal(entry),
+            live: true,
+            version: None,
+            star_system: None,
+            station: None,
+            body: None,
+        };
+
+        assert_eq!(system_text(&envelope), "Sol -> Sirius");
+    }
+
+    /// Rows as the table holds them, sequence numbers with a stand-in payload
+    fn rows(seqs: &[u64]) -> Vec<(u64, ())> {
+        seqs.iter().map(|&seq| (seq, ())).collect()
+    }
+
+    #[test]
+    fn anchor_holds_a_message_still_as_the_ring_evicts() {
+        let pitch = 22.0;
+        // Message 12 sits third from the top, five pixels scrolled past it.
+        let before = rows(&[10, 11, 12, 13, 14]);
+        assert_eq!(anchor_offset(&before, 12, 5.0, pitch), 2.0 * pitch + 5.0);
+
+        // Two arrivals drop 10 and 11; 12 is now the top row. The offset falls
+        // by exactly those two rows, so 12 stays where it was on screen.
+        let after = rows(&[12, 13, 14, 15, 16]);
+        assert_eq!(anchor_offset(&after, 12, 5.0, pitch), 5.0);
+    }
+
+    #[test]
+    fn anchor_to_an_evicted_message_lands_at_the_top() {
+        // Message 8 is already gone; nothing to hold, so the view sits at the
+        // oldest kept row.
+        let after = rows(&[12, 13, 14, 15, 16]);
+        assert_eq!(anchor_offset(&after, 8, 3.0, 22.0), 3.0);
+    }
+
+    #[test]
+    fn top_anchor_reads_the_top_row_and_its_remainder() {
+        let pitch = 22.0;
+        let view = rows(&[12, 13, 14, 15, 16]);
+        // Scrolled 49px down a 200px-tall content: two whole rows and 5 over,
+        // so message 14 is at the top with a five-pixel remainder.
+        assert_eq!(top_anchor(&view, 49.0, 200.0, pitch), Some((14, 5.0)));
+    }
+
+    #[test]
+    fn top_anchor_is_none_within_a_pixel_of_the_bottom() {
+        let view = rows(&[12, 13, 14, 15, 16]);
+        // At and just shy of the furthest scroll: tailing, no anchor.
+        assert_eq!(top_anchor(&view, 100.0, 100.0, 22.0), None);
+        assert_eq!(top_anchor(&view, 99.5, 100.0, 22.0), None);
+        // A row up from the bottom: scrolled away, so anchored.
+        assert!(top_anchor(&view, 95.0, 100.0, 22.0).is_some());
+    }
+
+    #[test]
+    fn top_anchor_is_none_for_an_empty_view() {
+        assert_eq!(top_anchor::<()>(&[], 0.0, 0.0, 22.0), None);
+    }
+
+    #[test]
+    fn delta_shows_the_span_and_its_sign() {
+        use chrono::Duration;
+        // Gateway later than the event: how long it took to arrive.
+        assert_eq!(format_delta(Duration::seconds(161)), "2m41s");
+        assert_eq!(format_delta(Duration::seconds(0)), "0s");
+        // A sender's clock running ahead reads as negative, not floored to 0s.
+        assert_eq!(format_delta(Duration::seconds(-3)), "-3s");
+    }
+
+    #[test]
+    fn the_delta_column_ships_present_but_off() {
+        let column = default_columns(false)
+            .into_iter()
+            .find(|c| c.field == Field::Delta)
+            .expect("delta column offered");
+        assert!(!column.visible);
+    }
+}
+
+/// The full rendering of an envelope for the detail pane
+fn detail(envelope: &Envelope) -> String {
+    let mut text = String::new();
+    let _ = writeln!(text, "schema:   {}", envelope.schema_ref);
+    let _ = writeln!(text, "live:     {}", envelope.live);
+    if let Some(system) = &envelope.star_system {
+        let _ = writeln!(text, "system:   {}", system);
+    }
+    if let Some(version) = &envelope.version {
+        let _ = writeln!(text, "version:  {}", version);
+    }
+    let _ = writeln!(
+        text,
+        "software: {} {}",
+        envelope.header.software_name, envelope.header.software_version
+    );
+    let _ = writeln!(text, "uploader: {}", envelope.header.uploader_id);
+    let _ = writeln!(
+        text,
+        "gateway:  {}",
+        envelope.header.gateway_timestamp.to_rfc3339()
+    );
+    let _ = writeln!(text);
+
+    match &envelope.message {
+        Message::Unmodeled(value) => {
+            let _ = writeln!(
+                text,
+                "{}",
+                to_string_pretty(value)
+                    .unwrap_or_else(|_| format!("{:?}", value))
+            );
+        }
+        modeled => {
+            let _ = writeln!(text, "{:#?}", modeled);
+        }
+    }
+    text
+}
+
+/// A compact rendering of how long the retained window spans, e.g. `2m41s`
+fn format_span(span: chrono::Duration) -> String {
+    let secs = span.num_seconds().max(0);
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// The gateway-minus-event span, e.g. `2m41s`, or `-3s` where the sender's
+/// clock runs ahead of the gateway's
+///
+/// [`format_span`] floors at zero, so the sign is carried here: without it a
+/// clock skew that makes the gateway look earlier than the event would read as
+/// `0s` rather than showing that it happened.
+fn format_delta(delta: chrono::Duration) -> String {
+    if delta.num_seconds() < 0 {
+        format!("-{}", format_span(-delta))
+    } else {
+        format_span(delta)
+    }
+}
+
+/// A panel's header: its title, and a button beside it to close the panel.
+///
+/// Returns whether that button was clicked, left for the caller to act on once
+/// it has finished borrowing the panel's own contents.
+fn panel_header(ui: &mut egui::Ui, title: RichText, close: &str) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(title);
+        ui.button(close).clicked()
+    })
+    .inner
+}
+
+/// The colour a log line is drawn in, chosen by its level.
+fn level_color(level: Level) -> Color32 {
+    match level {
+        Level::ERROR => Color32::LIGHT_RED,
+        Level::WARN => Color32::from_rgb(255, 200, 80),
+        Level::INFO => Color32::LIGHT_GREEN,
+        Level::DEBUG => Color32::LIGHT_BLUE,
+        Level::TRACE => Color32::GRAY,
+    }
+}

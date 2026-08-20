@@ -133,6 +133,11 @@ impl Stall {
         Stall { timeout, quiet_since: Instant::now() }
     }
 
+    /// How long the connection may carry nothing before it is given up
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// The quiet period starts again from now
     ///
     /// A message ends one. So does replacing the connection, which has not

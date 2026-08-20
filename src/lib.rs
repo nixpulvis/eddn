@@ -17,6 +17,7 @@ pub use crate::error::Error;
 
 use crate::connection::{Connection, Stall};
 use crate::reporter::Reporter;
+use bitflags::bitflags;
 use chrono::prelude::*;
 use elite_journal::entry::market::{BlackMarket, Outfitting, Shipyard};
 use elite_journal::entry::{Entry, Event, Market};
@@ -63,6 +64,24 @@ pub struct Envelope {
     /// [`None`] only where the reference is not one EDDN sends, which is the
     /// same case that leaves a message [`Message::Unmodeled`].
     pub version: Option<String>,
+
+    /// The system this message names, where it names one
+    ///
+    /// Every EDDN schema carries the system at the top of its payload --
+    /// `StarSystem` on the journal ones, `systemName` on the market ones -- so
+    /// it is read here once rather than dug out of whichever event or market
+    /// shape the payload became. [`None`] only where neither key is present.
+    pub star_system: Option<String>,
+
+    /// The station this message names, where it names one
+    ///
+    /// `StationName` on the journal schemas, `stationName` on the market ones.
+    pub station: Option<String>,
+
+    /// The body this message names, where it names one
+    ///
+    /// `BodyName` on most events, `Body` on the few that spell it that way.
+    pub body: Option<String>,
 }
 
 /// What the envelope looks like before its payload has been placed
@@ -83,6 +102,24 @@ impl<'de> Deserialize<'de> for Envelope {
         D: serde::Deserializer<'de>,
     {
         let raw = RawEnvelope::deserialize(deserializer)?;
+
+        // The system, station and body named at the top of the payload. Each
+        // key differs by schema, so every spelling it is sent under is tried.
+        // Kept here rather than dug out of whichever event or market shape the
+        // payload became.
+        let (star_system, station, body) = {
+            let field = |keys: &[&str]| {
+                keys.iter()
+                    .find_map(|key| raw.message.get(*key))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            };
+            (
+                field(&["StarSystem", "SystemName", "System", "systemName"]),
+                field(&["StationName", "stationName"]),
+                field(&["BodyName", "Body"]),
+            )
+        };
 
         // Everything the reference has to say, taken while it is still there
         // to borrow from.
@@ -105,6 +142,9 @@ impl<'de> Deserialize<'de> for Envelope {
             message,
             live,
             version,
+            star_system,
+            station,
+            body,
         })
     }
 }
@@ -131,8 +171,8 @@ pub struct Header {
 /// their own shapes and get their own variants.
 ///
 /// Guessing was what this did before, and there were two things it could not
-/// do. A schema whose payload has no `event` key at all — outfitting,
-/// shipyard, blackmarket — could never be told apart from any other, because
+/// do. A schema whose payload has no `event` key at all -- outfitting,
+/// shipyard, blackmarket -- could never be told apart from any other, because
 /// the guess had nothing to go on. And a payload that failed to parse looked
 /// exactly like a payload that belonged to some other variant, so it fell
 /// quietly to the catchall instead of being reported.
@@ -202,6 +242,27 @@ impl Message {
             }
             _ => Message::Unmodeled(message),
         })
+    }
+
+    /// The in-game moment the payload carries, where it carries one
+    ///
+    /// Every EDDN payload opens with a `timestamp`: when the game wrote the
+    /// event, as against [`Header::gateway_timestamp`], when EDDN received it.
+    /// The typed variants read it off their [`Entry`]; an unmodeled one is
+    /// still raw JSON, so it is read from the `timestamp` key there. [`None`]
+    /// only where that key is missing or unparseable.
+    pub fn timestamp(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Message::Journal(e) => Some(e.timestamp),
+            Message::Commodity(e) => Some(e.timestamp),
+            Message::Outfitting(e) => Some(e.timestamp),
+            Message::Shipyard(e) => Some(e.timestamp),
+            Message::BlackMarket(e) => Some(e.timestamp),
+            Message::Unmodeled(value) => value
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok()),
+        }
     }
 }
 
@@ -314,13 +375,7 @@ pub fn subscribe(
     stall_timeout: Option<Duration>,
 ) -> EnvelopeIterator {
     let ctx = Context::new();
-    let connection =
-        Connection::open(&ctx, url).expect("failed to open socket");
-
-    // Not "connected". Connecting is asynchronous, and whether it took is
-    // reported when the socket knows, along with everything later that
-    // happens to it.
-    info!("Subscribed to {}", url);
+    let connection = open_retrying(&ctx, url);
 
     EnvelopeIterator {
         ctx,
@@ -328,6 +383,67 @@ pub fn subscribe(
         connection,
         reports: Reporter::default(),
         stall: stall_timeout.map(Stall::new),
+        galaxy: Galaxy::LIVE,
+        started: false,
+    }
+}
+
+/// Open a socket, waiting out failures rather than giving up on them
+///
+/// A subscription is an infinite thing that replaces a connection forever (see
+/// [`EnvelopeIterator`]), so a socket that will not open is a wait, not a
+/// failure: each attempt that fails is logged and retried after a pause. The
+/// first connection and every replacement go through here alike, so the two
+/// behave the same and neither panics on a gateway that happens to be down.
+fn open_retrying(ctx: &Context, url: &str) -> Connection {
+    loop {
+        match Connection::open(ctx, url) {
+            Ok(connection) => return connection,
+            Err(err) => {
+                warn!("Could not open a socket: {}", err);
+                thread::sleep(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+bitflags! {
+    /// Which galaxy's data to hand over
+    ///
+    /// EDDN carries alpha and beta ("test") data on the same socket as the live
+    /// galaxy, told apart by a `/test` suffix on the `$schemaRef` (see
+    /// [`Envelope::live`]). Keeping the live galaxy and keeping the test one are
+    /// independent choices, so this is a set of the two rather than a list of
+    /// their combinations: [`LIVE`](Galaxy::LIVE), [`TEST`](Galaxy::TEST), or
+    /// [`ALL`](Galaxy::ALL) for both. Only the live galaxy is handed over unless
+    /// asked otherwise, so a subscriber cannot record test data by forgetting to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Galaxy: u8 {
+        /// The live galaxy everyone plays in.
+        const LIVE = 1 << 0;
+        /// The alpha and beta test galaxies.
+        const TEST = 1 << 1;
+        /// Both the live galaxy and the test ones.
+        const ALL = Self::LIVE.bits() | Self::TEST.bits();
+    }
+}
+
+impl Default for Galaxy {
+    /// The live galaxy alone, so test data is never recorded unasked.
+    fn default() -> Self {
+        Galaxy::LIVE
+    }
+}
+
+impl Galaxy {
+    /// Whether a message in the live-or-not galaxy belongs to this set
+    ///
+    /// A live message belongs where [`LIVE`](Galaxy::LIVE) is set, a test one
+    /// where [`TEST`](Galaxy::TEST) is, and [`ALL`](Galaxy::ALL) holds both. The
+    /// one predicate both the subscriber's frame filter and a viewer's galaxy
+    /// filter read, so the two cannot disagree on what a galaxy admits.
+    pub fn shows(self, live: bool) -> bool {
+        self.contains(if live { Galaxy::LIVE } else { Galaxy::TEST })
     }
 }
 
@@ -343,6 +459,13 @@ pub struct EnvelopeIterator {
     reports: Reporter,
     /// Absent when the caller asked for no stall timeout at all.
     stall: Option<Stall>,
+
+    /// Which galaxy's data to hand over; the live one unless asked otherwise.
+    galaxy: Galaxy,
+
+    /// Whether the opening `subscribed` line has been logged yet. Logged on
+    /// the first `next`, when the galaxy the builder chose is final.
+    started: bool,
 }
 
 impl EnvelopeIterator {
@@ -356,22 +479,20 @@ impl EnvelopeIterator {
         // the very most, and is worth hearing about every time it does.
         warn!("{}, replacing the connection", reason);
 
-        loop {
-            match Connection::open(&self.ctx, &self.url) {
-                Ok(connection) => {
-                    self.connection = connection;
-                    if let Some(stall) = &mut self.stall {
-                        stall.restart();
-                    }
-                    self.reports.replaced();
-                    return;
-                }
-                Err(err) => {
-                    warn!("Could not open a socket: {}", err);
-                    thread::sleep(Duration::from_secs(5));
-                }
-            }
+        self.connection = open_retrying(&self.ctx, &self.url);
+        if let Some(stall) = &mut self.stall {
+            stall.restart();
         }
+        self.reports.replaced();
+    }
+
+    /// Choose which galaxy's data to hand over
+    ///
+    /// [`Galaxy::LIVE`] by default, so a subscriber records only the live
+    /// galaxy unless it asks for the rest.
+    pub fn galaxy(mut self, galaxy: Galaxy) -> Self {
+        self.galaxy = galaxy;
+        self
     }
 }
 
@@ -388,7 +509,10 @@ impl EnvelopeIterator {
 /// [`None`] is a frame deliberately let go. A frame that could not be read at
 /// all is `Some(Err(_))`, and the difference matters: alpha and beta data
 /// arriving is ordinary, and a message that will not decompress is not.
-fn read_frame(compressed: &[u8]) -> Option<Result<Envelope, Error>> {
+fn read_frame(
+    compressed: &[u8],
+    galaxy: Galaxy,
+) -> Option<Result<Envelope, Error>> {
     let read = inflate::decompress_to_vec_zlib(compressed)
         .map_err(Error::Decompress)
         .and_then(|json| {
@@ -403,13 +527,13 @@ fn read_frame(compressed: &[u8]) -> Option<Result<Envelope, Error>> {
             })
         });
 
-    // Alpha and beta data arrives on this socket alongside the live galaxy
-    // and is dropped here rather than handed over, so that a subscriber
-    // cannot record it by forgetting to ask. Whoever wants it can read an
-    // envelope directly and look at `live`.
+    // Alpha and beta data arrives on this socket alongside the live galaxy.
+    // Which of the two a subscriber wanted is `galaxy`'s to say; the rest is
+    // dropped here rather than handed over, so it cannot be recorded by
+    // forgetting to ask. See [`Envelope::live`].
     if let Ok(envelope) = &read {
-        if !envelope.live {
-            debug!(schema = %envelope.schema_ref, "not live");
+        if !galaxy.shows(envelope.live) {
+            debug!(schema = %envelope.schema_ref, "filtered by galaxy");
             return None;
         }
     }
@@ -421,6 +545,24 @@ impl Iterator for EnvelopeIterator {
     type Item = Result<Envelope, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // "subscribed", not "connected": connecting is asynchronous, so this
+        // only says the socket is open and trying, and whether it took is
+        // reported when the socket knows. Said on the first poll rather than
+        // in `subscribe` so the galaxy the builder chose is part of it.
+        if !self.started {
+            self.started = true;
+            let stall = self.stall.as_ref().map_or_else(
+                || "off".to_owned(),
+                |s| format!("{}s", s.timeout().as_secs()),
+            );
+            info!(
+                url = %self.url,
+                stall = %stall,
+                galaxy = ?self.galaxy,
+                "subscribed"
+            );
+        }
+
         loop {
             // Before the receive, not only when one comes back empty. A
             // gateway sending steadily can still have lost and rebuilt its
@@ -450,7 +592,7 @@ impl Iterator for EnvelopeIterator {
                         }
                     };
 
-                    if let Some(read) = read_frame(frame) {
+                    if let Some(read) = read_frame(frame, self.galaxy) {
                         return Some(read);
                     }
 
@@ -524,12 +666,67 @@ mod tests {
         "SystemAddress": 10477373803
     }"#;
 
+    #[test]
+    fn envelope_names_its_system() {
+        // Journal messages carry the system as a top-level `StarSystem`.
+        let jump = envelope("https://eddn.edcd.io/schemas/journal/1", JUMP);
+        assert_eq!(jump.star_system.as_deref(), Some("Sol"));
+
+        // Market messages carry it as `systemName` instead.
+        let market = envelope(
+            "https://eddn.edcd.io/schemas/commodity/3",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "systemName": "Shinrarta Dezhra",
+                "stationName": "Jameson Memorial",
+                "marketId": 128666762,
+                "commodities": []
+            }"#,
+        );
+        assert_eq!(market.star_system.as_deref(), Some("Shinrarta Dezhra"));
+        assert_eq!(market.station.as_deref(), Some("Jameson Memorial"));
+
+        // FSSDiscoveryScan names it `SystemName`, not `StarSystem`.
+        let fss = envelope(
+            "https://eddn.edcd.io/schemas/fssdiscoveryscan/1",
+            r#"{
+                "timestamp": "2026-08-08T12:00:00Z",
+                "event": "FSSDiscoveryScan",
+                "SystemName": "M52 Sector PF-T b18-0",
+                "SystemAddress": 1234,
+                "BodyCount": 5,
+                "NonBodyCount": 2
+            }"#,
+        );
+        assert_eq!(fss.star_system.as_deref(), Some("M52 Sector PF-T b18-0"));
+    }
+
     /// The schema names the payload, so a journal schema is a journal entry
     #[test]
     fn a_journal_message_is_a_journal_entry() {
         let envelope = envelope("https://eddn.edcd.io/schemas/journal/1", JUMP);
 
         assert!(matches!(envelope.message, Message::Journal(_)));
+    }
+
+    /// The event's own time is read, typed or not, and absent where unwritten
+    #[test]
+    fn a_message_gives_up_its_event_time() {
+        let when: DateTime<Utc> =
+            "2026-08-08T12:00:00Z".parse().expect("fixture time parses");
+
+        // A typed journal entry reads it off the entry.
+        let jump = envelope("https://eddn.edcd.io/schemas/journal/1", JUMP);
+        assert_eq!(jump.message.timestamp(), Some(when));
+
+        // An unmodeled payload is still raw JSON, read from its key.
+        let unread = envelope("nonsense", JUMP);
+        assert!(matches!(unread.message, Message::Unmodeled(_)));
+        assert_eq!(unread.message.timestamp(), Some(when));
+
+        // Nothing there to read leaves nothing to return.
+        let bare = Message::Unmodeled(serde_json::json!({}));
+        assert_eq!(bare.timestamp(), None);
     }
 
     /// Every schema whose payload is a journal event reads as one
@@ -794,7 +991,7 @@ mod frames {
     /// Live data is handed over
     #[test]
     fn a_live_frame_is_handed_over() {
-        let read = read_frame(&frame(JOURNAL, JUMP))
+        let read = read_frame(&frame(JOURNAL, JUMP), Galaxy::LIVE)
             .expect("a live frame should be handed over");
 
         let envelope = read.expect("and should read");
@@ -808,7 +1005,14 @@ mod frames {
     /// was understood; this says something acts on it.
     #[test]
     fn a_test_frame_is_let_go() {
-        assert!(read_frame(&frame(JOURNAL_TEST, JUMP)).is_none());
+        // Live: the test frame is dropped; All and Test keep it.
+        assert!(read_frame(&frame(JOURNAL_TEST, JUMP), Galaxy::LIVE).is_none());
+        let kept = read_frame(&frame(JOURNAL_TEST, JUMP), Galaxy::ALL)
+            .expect("a test frame should be kept under All")
+            .expect("and should read");
+        assert!(!kept.live);
+        // And Test drops the live galaxy.
+        assert!(read_frame(&frame(JOURNAL, JUMP), Galaxy::TEST).is_none());
     }
 
     /// A frame that is not zlib is reported rather than let go
@@ -820,7 +1024,7 @@ mod frames {
     #[test]
     fn a_frame_that_is_not_zlib_is_reported() {
         assert!(matches!(
-            read_frame(b"not zlib at all"),
+            read_frame(b"not zlib at all", Galaxy::LIVE),
             Some(Err(Error::Decompress(_))),
         ));
     }
@@ -830,7 +1034,10 @@ mod frames {
     fn a_frame_that_is_not_an_envelope_is_reported() {
         let rubbish = miniz_oxide::deflate::compress_to_vec_zlib(b"{}", 6);
 
-        assert!(matches!(read_frame(&rubbish), Some(Err(Error::Parse { .. }))));
+        assert!(matches!(
+            read_frame(&rubbish, Galaxy::LIVE),
+            Some(Err(Error::Parse { .. }))
+        ));
     }
 
     /// And one whose payload disagrees with its schema
@@ -852,7 +1059,10 @@ mod frames {
         let bad =
             miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 6);
 
-        assert!(matches!(read_frame(&bad), Some(Err(Error::Parse { .. }))));
+        assert!(matches!(
+            read_frame(&bad, Galaxy::LIVE),
+            Some(Err(Error::Parse { .. }))
+        ));
     }
 
     /// A payload error carries the message, so the field can be found
@@ -879,7 +1089,7 @@ mod frames {
         let bad =
             miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 6);
 
-        let Some(Err(err)) = read_frame(&bad) else {
+        let Some(Err(err)) = read_frame(&bad, Galaxy::LIVE) else {
             panic!("a payload that will not read should be reported")
         };
         let said = err.to_string();
@@ -900,7 +1110,7 @@ mod frames {
             6,
         );
 
-        let Some(Err(err)) = read_frame(&truncated) else {
+        let Some(Err(err)) = read_frame(&truncated, Galaxy::LIVE) else {
             panic!("a malformed envelope should be reported")
         };
 

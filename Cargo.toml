@@ -4,7 +4,22 @@ description = "Elite: Dangerous Data Network (EDDN) subscriber"
 version = "0.4.0"
 authors = ["Nathan Lilienthal <nathan@nixpulvis.com>"]
 license = "Beerware"
-edition = "2018"
+edition = "2021"
+
+[[bin]]
+name = "eddn_gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+[features]
+gui = [
+    "dep:eframe",
+    "dep:egui",
+    "dep:egui_extras",
+    "dep:parking_lot",
+    "dep:clap",
+    "dep:tracing-subscriber",
+]
 
 [dependencies]
 elite_journal = "0.5"
@@ -14,6 +29,14 @@ chrono = "0.4"
 tracing = "0.1"
 miniz_oxide = "0.4"
 omq-tokio = "0.21"
+bitflags = "2"
+
+eframe = { version = "0.34", optional = true }
+egui = { version = "0.34", optional = true }
+egui_extras = { version = "0.34", optional = true }
+parking_lot = { version = "0.12", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
