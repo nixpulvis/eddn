@@ -44,10 +44,14 @@ struct Args {
     /// Show non-live (alpha/beta) events too
     #[arg(long)]
     test: bool,
+
+    /// Messages to keep in the scrollback; older ones fall out of the window
+    #[arg(long, default_value_t = feed::DEFAULT_CAPACITY)]
+    capacity: usize,
 }
 
 fn main() -> eframe::Result {
-    let Args { url, stall, test: include_test } = Args::parse();
+    let Args { url, stall, test: include_test, capacity } = Args::parse();
     // `--stall 0` leaves the connection alone however long it carries nothing.
     let stall = (stall != 0).then(|| Duration::from_secs(stall));
 
@@ -91,7 +95,7 @@ fn main() -> eframe::Result {
             // Spawned here because the worker needs the egui context to wake
             // the UI, and this is the first place it exists.
             worker::spawn(url, stall, include_test, tx, cc.egui_ctx.clone());
-            Ok(Box::new(app::App::new(rx, log, include_test)))
+            Ok(Box::new(app::App::new(rx, log, include_test, capacity)))
         }),
     )
 }

@@ -46,6 +46,9 @@ const STALL_SIGMAS: f64 = 4.0;
 /// either tripping on a burst of near-simultaneous messages.
 const MIN_GAP: Duration = Duration::from_secs(1);
 
+/// How many one-second rate samples the sparkline keeps -- about three minutes
+const RATE_SAMPLES: usize = 180;
+
 /// The feed's arrival timing and the statistics the stall warning reads
 #[derive(Default)]
 pub struct Cadence {
@@ -58,6 +61,12 @@ pub struct Cadence {
     last: Option<Instant>,
     /// When the first message ever arrived, for scaling the rate window.
     first: Option<Instant>,
+    /// One-per-second samples of the rate and whether the feed was stalled at
+    /// that moment, newest last, bounded to [`RATE_SAMPLES`]. Feeds the
+    /// status-bar sparkline and its stall shading.
+    samples: VecDeque<(f32, bool)>,
+    /// When the rate was last sampled into `samples`.
+    last_sample: Option<Instant>,
 }
 
 impl Cadence {
@@ -86,15 +95,32 @@ impl Cadence {
         connection_gap
     }
 
-    /// Drop arrivals that have aged out of the rate window as of `now`
+    /// Advance the cadence to `now`: age out old arrivals and sample the rate
     ///
     /// Called every frame, not only on arrival, so the rate decays toward zero
-    /// through a silence rather than freezing at the value it last held.
-    pub fn prune(&mut self, now: Instant) {
+    /// through a silence rather than freezing at the value it last held, and so
+    /// the sparkline gets a sample about once a second whether or not messages
+    /// are arriving.
+    pub fn tick(&mut self, now: Instant) {
         let cutoff = now - RATE_WINDOW;
         while self.arrivals.front().is_some_and(|at| *at < cutoff) {
             self.arrivals.pop_front();
         }
+        let due = self.last_sample.map_or(true, |at| {
+            now.duration_since(at) >= Duration::from_secs(1)
+        });
+        if due {
+            self.last_sample = Some(now);
+            self.samples.push_back((self.rate() as f32, self.stalled()));
+            while self.samples.len() > RATE_SAMPLES {
+                self.samples.pop_front();
+            }
+        }
+    }
+
+    /// The recent one-per-second (rate, stalled) samples, oldest first
+    pub fn samples(&self) -> &VecDeque<(f32, bool)> {
+        &self.samples
     }
 
     /// When the most recent message arrived, if any has

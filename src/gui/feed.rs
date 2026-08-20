@@ -269,11 +269,6 @@ impl Feed {
             .map(|kept| (&kept.envelope, kept.search.as_str(), kept.gap))
     }
 
-    /// The largest number of envelopes the window will hold
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
     /// How many envelopes have ever been pushed, kept or dropped
     pub fn received(&self) -> u64 {
         self.received

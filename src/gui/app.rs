@@ -10,6 +10,7 @@ use eddn::{Envelope, Galaxy, Message};
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use serde_json::to_string_pretty;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -100,14 +101,16 @@ pub struct App {
 }
 
 impl App {
-    /// Build the app around the worker's channel and the shared log buffer.
+    /// Build the app around the worker's channel, the shared log buffer, and
+    /// the size of the feed's scrollback window.
     pub fn new(
         updates: Receiver<Update>,
         log: LogBuffer,
         test_enabled: bool,
+        capacity: usize,
     ) -> Self {
         App {
-            feed: Feed::default(),
+            feed: Feed::new(capacity),
             updates,
             log,
             filter: String::new(),
@@ -148,7 +151,7 @@ impl App {
             }
         }
 
-        self.cadence.prune(Instant::now());
+        self.cadence.tick(Instant::now());
     }
 
     /// The health of the feed's connection, as the status dot shows it.
@@ -160,7 +163,7 @@ impl App {
         } else if self.cadence.stalled() {
             Connection::Stalling
         } else {
-            Connection::Live
+            Connection::Online
         }
     }
 }
@@ -171,7 +174,7 @@ enum Connection {
     /// No message has arrived yet; the socket is still coming up.
     Connecting,
     /// Messages are arriving about as often as the rate predicts.
-    Live,
+    Online,
     /// The feed has gone quiet for longer than its rate predicts.
     Stalling,
     /// The stream stopped; no more messages are coming.
@@ -182,13 +185,13 @@ impl Connection {
     /// The dot's colour for the active theme, readable on light and dark
     ///
     /// Stalling and stopped borrow egui's own warn/error colours so they track
-    /// the theme. Live and connecting are tuned per mode, since the light-green
-    /// and grey that read on a dark background wash out on a light one.
+    /// the theme. Online and connecting are tuned per mode, since a dark
+    /// theme's light-green and grey wash out on a light background.
     fn color(self, visuals: &egui::Visuals) -> Color32 {
         match self {
             Connection::Connecting => visuals.weak_text_color(),
-            Connection::Live if visuals.dark_mode => Color32::LIGHT_GREEN,
-            Connection::Live => Color32::from_rgb(0x1a, 0x7f, 0x37),
+            Connection::Online if visuals.dark_mode => Color32::LIGHT_GREEN,
+            Connection::Online => Color32::from_rgb(0x1a, 0x7f, 0x37),
             Connection::Stalling => visuals.warn_fg_color,
             Connection::Stopped => visuals.error_fg_color,
         }
@@ -198,7 +201,7 @@ impl Connection {
     fn label(self) -> &'static str {
         match self {
             Connection::Connecting => "connecting",
-            Connection::Live => "live",
+            Connection::Online => "online",
             Connection::Stalling => "stalling",
             Connection::Stopped => "stopped",
         }
@@ -208,7 +211,7 @@ impl Connection {
     fn tooltip(self) -> &'static str {
         match self {
             Connection::Connecting => "waiting for the first message",
-            Connection::Live => "messages arriving as expected",
+            Connection::Online => "messages arriving as expected",
             Connection::Stalling => "quieter than the feed's rate predicts",
             Connection::Stopped => "the stream stopped; the feed is frozen",
         }
@@ -267,6 +270,50 @@ impl eframe::App for App {
     }
 }
 
+/// A compact line of the recent message rate, beside the numeric rate
+///
+/// One-per-second samples scaled to the tallest in view, newest at the right --
+/// a bare polyline, no axes or interaction, since it is a glance not a plot.
+fn rate_sparkline(ui: &mut egui::Ui, samples: &VecDeque<(f32, bool)>) {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(72.0, ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    if samples.len() < 2 {
+        return;
+    }
+    let peak = samples.iter().map(|&(r, _)| r).fold(0.0_f32, f32::max).max(1.0);
+    let last = (samples.len() - 1) as f32;
+    let x = |i: usize| rect.left() + rect.width() * (i as f32 / last);
+
+    // Wash the stalled spans yellow behind the line, so a dip reads as a stall
+    // rather than a quiet feed. One rect per stalled step; contiguous ones
+    // abut into a band.
+    let warn = ui.visuals().warn_fg_color;
+    let wash =
+        egui::Color32::from_rgba_unmultiplied(warn.r(), warn.g(), warn.b(), 48);
+    for i in 0..samples.len() - 1 {
+        if samples[i].1 {
+            let band = egui::Rect::from_x_y_ranges(
+                egui::Rangef::new(x(i), x(i + 1)),
+                rect.y_range(),
+            );
+            ui.painter().rect_filled(band, egui::CornerRadius::ZERO, wash);
+        }
+    }
+
+    let points: Vec<egui::Pos2> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &(r, _))| {
+            egui::pos2(x(i), rect.bottom() - rect.height() * (r / peak))
+        })
+        .collect();
+    let stroke = egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
+    ui.painter().add(egui::Shape::line(points, stroke));
+    response.on_hover_text(format!("peak {peak:.0}/s over {}s", samples.len()));
+}
+
 impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("status").show_inside(ui, |ui| {
@@ -291,27 +338,6 @@ impl App {
                 let word = ui.label(RichText::new(conn.label()).color(color));
                 dot.on_hover_text(conn.tooltip());
                 word.on_hover_text(conn.tooltip());
-                ui.separator();
-                let received =
-                    ui.label(format!("received {}", self.feed.received()));
-                if !self.feed.per_schema().is_empty() {
-                    received.on_hover_ui(|ui| {
-                        for (family, count) in self.feed.per_schema() {
-                            ui.label(
-                                RichText::new(format!("{count:>6}  {family}"))
-                                    .monospace(),
-                            );
-                        }
-                    });
-                }
-                ui.label(format!(
-                    "kept {}/{}",
-                    self.feed.retained(),
-                    self.feed.capacity()
-                ));
-                if let Some(span) = self.feed.window_duration() {
-                    ui.label(format!("span {}", format_span(span)));
-                }
                 if self.feed.errors() > 0 {
                     let text =
                         RichText::new(format!("errors {}", self.feed.errors()))
@@ -330,6 +356,8 @@ impl App {
                         self.show_log = true;
                     }
                 }
+                ui.separator();
+                rate_sparkline(ui, self.cadence.samples());
                 ui.label(format!("{:.1}/s", self.cadence.rate()));
                 ui.label(match self.cadence.last() {
                     Some(at) => {
@@ -337,6 +365,31 @@ impl App {
                     }
                     None => "waiting...".to_owned(),
                 });
+                ui.separator();
+                let received =
+                    ui.label(format!("received {}", self.feed.received()));
+                if !self.feed.per_schema().is_empty() {
+                    received.on_hover_ui(|ui| {
+                        for (family, count) in self.feed.per_schema() {
+                            ui.label(
+                                RichText::new(format!("{count:>6}  {family}"))
+                                    .monospace(),
+                            );
+                        }
+                    });
+                }
+                if let Some(span) = self.feed.window_duration() {
+                    ui.label(format!("span {}", format_span(span)));
+                }
+                let received = self.feed.received();
+                let saved = if received == 0 {
+                    100.0
+                } else {
+                    100.0 * self.feed.retained() as f64 / received as f64
+                };
+                ui.label(format!("saved {saved:.1}%")).on_hover_text(
+                    "share of received messages still in the window",
+                );
                 ui.separator();
                 if ui.button("follow").clicked() {
                     self.follow_latest = true;
@@ -833,6 +886,7 @@ fn top_anchor<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feed::DEFAULT_CAPACITY;
     use crate::log_pane::LogBuffer;
     use chrono::Utc;
     use eddn::Header;
@@ -861,7 +915,7 @@ mod tests {
     fn test_mode_starts_on_the_test_galaxy() {
         // --test is asked for to watch test data, so that is what shows first.
         let (_tx, rx) = mpsc::channel();
-        let app = App::new(rx, LogBuffer::default(), true);
+        let app = App::new(rx, LogBuffer::default(), true, DEFAULT_CAPACITY);
         assert_eq!(app.view, Galaxy::TEST);
     }
 
@@ -869,14 +923,15 @@ mod tests {
     fn without_test_mode_every_row_shows() {
         // Only live events arrive, so the galaxy filter admits all of them.
         let (_tx, rx) = mpsc::channel();
-        let app = App::new(rx, LogBuffer::default(), false);
+        let app = App::new(rx, LogBuffer::default(), false, DEFAULT_CAPACITY);
         assert_eq!(app.view, Galaxy::ALL);
     }
 
     #[test]
     fn drain_moves_updates_into_the_feed() {
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(rx, LogBuffer::default(), false);
+        let mut app =
+            App::new(rx, LogBuffer::default(), false, DEFAULT_CAPACITY);
 
         tx.send(Update::Envelope(Box::new(envelope(true)))).unwrap();
         tx.send(Update::Envelope(Box::new(envelope(false)))).unwrap();
@@ -895,7 +950,8 @@ mod tests {
     #[test]
     fn a_dropped_worker_channel_stops_the_stream() {
         let (tx, rx) = mpsc::channel::<Update>();
-        let mut app = App::new(rx, LogBuffer::default(), false);
+        let mut app =
+            App::new(rx, LogBuffer::default(), false, DEFAULT_CAPACITY);
 
         drop(tx);
         app.drain();
@@ -906,7 +962,8 @@ mod tests {
     #[test]
     fn a_single_message_reads_live_not_connecting() {
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(rx, LogBuffer::default(), false);
+        let mut app =
+            App::new(rx, LogBuffer::default(), false, DEFAULT_CAPACITY);
 
         // Connecting only holds while nothing has arrived.
         assert_eq!(app.connection(), Connection::Connecting);
@@ -915,13 +972,14 @@ mod tests {
         // the connection reads live even before there are gaps to judge a stall.
         tx.send(Update::Envelope(Box::new(envelope(true)))).unwrap();
         app.drain();
-        assert_eq!(app.connection(), Connection::Live);
+        assert_eq!(app.connection(), Connection::Online);
     }
 
     #[test]
     fn connection_reflects_stream_and_cadence() {
         let (_tx, rx) = mpsc::channel::<Update>();
-        let mut app = App::new(rx, LogBuffer::default(), false);
+        let mut app =
+            App::new(rx, LogBuffer::default(), false, DEFAULT_CAPACITY);
 
         // No message yet: still coming up.
         assert_eq!(app.connection(), Connection::Connecting);
@@ -929,7 +987,7 @@ mod tests {
         // A steady 1s cadence, last message just now: live.
         let steady = [1.0, 1.0, 1.0, 1.0];
         app.cadence = Cadence::from_parts(steady, Some(Instant::now()));
-        assert_eq!(app.connection(), Connection::Live);
+        assert_eq!(app.connection(), Connection::Online);
 
         // The same cadence gone quiet for 5s: an outlier, so stalling.
         app.cadence = Cadence::from_parts(
