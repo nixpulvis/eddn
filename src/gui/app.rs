@@ -1,6 +1,7 @@
 //! The window: a list of what has come off the socket, a look at any one of
 //! it, the crate's log, and a line of totals across the top.
 
+use crate::cadence::Cadence;
 use crate::feed::{event_label, schema_family, system_text, Feed};
 use crate::log_pane::{LogBuffer, LogLine};
 use crate::worker::Update;
@@ -9,23 +10,10 @@ use eddn::{Envelope, Galaxy, Message};
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use serde_json::to_string_pretty;
-use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use tracing::Level;
-
-/// How long an arrival counts toward the rate shown
-const RATE_WINDOW: Duration = Duration::from_secs(5);
-
-/// The shortest span the rate is averaged over
-///
-/// Until [`RATE_WINDOW`] of history exists the rate is averaged over how long
-/// the feed has actually been running, which starts near zero. This floors that
-/// span at one second: the reading fills smoothly from zero to the true rate
-/// over the first second rather than dividing a message or two by almost
-/// nothing and jumping around before it settles.
-const RATE_WINDOW_MIN: Duration = Duration::from_secs(1);
 
 /// One line's height in the feed list, for the scroll area's row maths
 const ROW_HEIGHT: f32 = 18.0;
@@ -84,12 +72,13 @@ pub struct App {
     /// already follows the newest row.
     feed_anchor: Option<(u64, f32)>,
 
-    /// When each of the last [`RATE_WINDOW`] of arrivals came in.
-    arrivals: VecDeque<Instant>,
-    /// When the most recent message arrived, for the age shown.
-    last_arrival: Option<Instant>,
-    /// When the first message ever arrived, for scaling the rate window.
-    first_arrival: Option<Instant>,
+    /// The feed's arrival timing: the rate shown in the status bar and the
+    /// statistics behind the connection dot. See [`Cadence`].
+    cadence: Cadence,
+
+    /// Set once the worker reports the stream ended (or its channel drops), so
+    /// the status dot shows a dead feed apart from a merely quiet one.
+    stream_ended: bool,
 
     /// The frame the feed and log were last taken in
     ///
@@ -129,9 +118,8 @@ impl App {
             show_log: false,
             follow_latest: false,
             feed_anchor: None,
-            arrivals: VecDeque::new(),
-            last_arrival: None,
-            first_arrival: None,
+            cadence: Cadence::default(),
+            stream_ended: false,
             last_frame: None,
             log_lines: Vec::new(),
             detail_width: None,
@@ -140,37 +128,88 @@ impl App {
 
     /// Take everything the worker has handed over since the last frame
     fn drain(&mut self) {
-        while let Ok(update) = self.updates.try_recv() {
-            match update {
-                Update::Envelope(envelope) => {
-                    let now = Instant::now();
-                    self.arrivals.push_back(now);
-                    self.last_arrival = Some(now);
-                    self.first_arrival.get_or_insert(now);
+        loop {
+            match self.updates.try_recv() {
+                Ok(Update::Envelope(envelope)) => {
+                    self.cadence.record(Instant::now());
                     self.feed.push(*envelope);
                 }
-                Update::Error => self.feed.note_error(),
+                Ok(Update::Error) => self.feed.note_error(),
+                Err(TryRecvError::Empty) => break,
+                // Every sender gone means the worker thread has stopped. It only
+                // ends by unwinding, since subscribe() never returns, so the
+                // feed is dead: the dot goes red.
+                Err(TryRecvError::Disconnected) => {
+                    self.stream_ended = true;
+                    break;
+                }
             }
         }
 
-        let cutoff = Instant::now() - RATE_WINDOW;
-        while self.arrivals.front().is_some_and(|at| *at < cutoff) {
-            self.arrivals.pop_front();
+        self.cadence.prune(Instant::now());
+    }
+
+    /// The health of the feed's connection, as the status dot shows it.
+    fn connection(&self) -> Connection {
+        if self.stream_ended {
+            Connection::Stopped
+        } else if self.cadence.last().is_none() {
+            Connection::Connecting
+        } else if self.cadence.stalled() {
+            Connection::Stalling
+        } else {
+            Connection::Live
+        }
+    }
+}
+
+/// The feed connection's health, from green to red
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Connection {
+    /// No message has arrived yet; the socket is still coming up.
+    Connecting,
+    /// Messages are arriving about as often as the rate predicts.
+    Live,
+    /// The feed has gone quiet for longer than its rate predicts.
+    Stalling,
+    /// The stream stopped; no more messages are coming.
+    Stopped,
+}
+
+impl Connection {
+    /// The dot's colour for the active theme, readable on light and dark
+    ///
+    /// Stalling and stopped borrow egui's own warn/error colours so they track
+    /// the theme. Live and connecting are tuned per mode, since the light-green
+    /// and grey that read on a dark background wash out on a light one.
+    fn color(self, visuals: &egui::Visuals) -> Color32 {
+        match self {
+            Connection::Connecting => visuals.weak_text_color(),
+            Connection::Live if visuals.dark_mode => Color32::LIGHT_GREEN,
+            Connection::Live => Color32::from_rgb(0x1a, 0x7f, 0x37),
+            Connection::Stalling => visuals.warn_fg_color,
+            Connection::Stopped => visuals.error_fg_color,
         }
     }
 
-    /// Messages a second
-    ///
-    /// Averaged over how long the feed has been running, growing from the first
-    /// message until it reaches [`RATE_WINDOW`]. Dividing by the full window
-    /// before that much history exists understates the rate at startup.
-    fn rate(&self) -> f64 {
-        let Some(first) = self.first_arrival else {
-            return 0.0;
-        };
-        let window =
-            first.elapsed().clamp(RATE_WINDOW_MIN, RATE_WINDOW).as_secs_f64();
-        self.arrivals.len() as f64 / window
+    /// The word beside the dot.
+    fn label(self) -> &'static str {
+        match self {
+            Connection::Connecting => "connecting",
+            Connection::Live => "live",
+            Connection::Stalling => "stalling",
+            Connection::Stopped => "stopped",
+        }
+    }
+
+    /// What the dot means, on hover.
+    fn tooltip(self) -> &'static str {
+        match self {
+            Connection::Connecting => "waiting for the first message",
+            Connection::Live => "messages arriving as expected",
+            Connection::Stalling => "quieter than the feed's rate predicts",
+            Connection::Stopped => "the stream stopped; the feed is frozen",
+        }
     }
 }
 
@@ -236,6 +275,19 @@ impl App {
                 // so it ticks without any clock of its own.
                 ui.monospace(Utc::now().format(TIMESTAMP_FORMAT).to_string());
                 ui.separator();
+                // Connection health at a glance, so a stall or a dead stream
+                // shows without opening the log. Painted rather than a glyph,
+                // to match the live/test dots and render the same in any font.
+                // After the clock so the two stay lined up as the state changes.
+                let conn = self.connection();
+                let color = conn.color(ui.visuals());
+                let (rect, dot) = ui
+                    .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.0, color);
+                let word = ui.label(RichText::new(conn.label()).color(color));
+                dot.on_hover_text(conn.tooltip());
+                word.on_hover_text(conn.tooltip());
+                ui.separator();
                 let received =
                     ui.label(format!("received {}", self.feed.received()));
                 if !self.feed.per_schema().is_empty() {
@@ -262,8 +314,8 @@ impl App {
                             .color(Color32::LIGHT_RED),
                     );
                 }
-                ui.label(format!("{:.1}/s", self.rate()));
-                ui.label(match self.last_arrival {
+                ui.label(format!("{:.1}/s", self.cadence.rate()));
+                ui.label(match self.cadence.last() {
                     Some(at) => {
                         format!("last {:.0}s ago", at.elapsed().as_secs_f64())
                     }
@@ -770,37 +822,63 @@ mod tests {
         app.drain();
 
         // Two envelopes counted and kept, the error counted apart, and the
-        // rate window and age both moved by the arrivals.
+        // arrivals recorded in the cadence.
         assert_eq!(app.feed.received(), 2);
         assert_eq!(app.feed.retained(), 2);
         assert_eq!(app.feed.errors(), 1);
-        assert_eq!(app.arrivals.len(), 2);
-        assert!(app.last_arrival.is_some());
-        assert!(app.first_arrival.is_some());
+        assert!(app.cadence.last().is_some());
+        assert!(app.cadence.rate() > 0.0);
     }
 
     #[test]
-    fn rate_scales_until_the_window_saturates() {
-        let (_tx, rx) = mpsc::channel();
+    fn a_dropped_worker_channel_stops_the_stream() {
+        let (tx, rx) = mpsc::channel::<Update>();
         let mut app = App::new(rx, LogBuffer::default(), false);
-        let now = Instant::now();
-        for _ in 0..30 {
-            app.arrivals.push_back(now);
-        }
 
-        // ~1s into the feed: averaged over the second actually observed, not the
-        // full window, so 30 messages read as ~30/s rather than 30/5 = 6/s.
-        app.first_arrival = Some(now - Duration::from_secs(1));
-        let ramping = app.rate();
-        assert!((25.0..=31.0).contains(&ramping), "ramping rate was {ramping}");
+        drop(tx);
+        app.drain();
 
-        // Past RATE_WINDOW: averaged over the full window, so 30 / 5 = 6/s.
-        app.first_arrival = Some(now - Duration::from_secs(30));
-        let saturated = app.rate();
-        assert!(
-            (5.5..=6.5).contains(&saturated),
-            "saturated rate was {saturated}"
+        assert!(app.stream_ended);
+    }
+
+    #[test]
+    fn a_single_message_reads_live_not_connecting() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(rx, LogBuffer::default(), false);
+
+        // Connecting only holds while nothing has arrived.
+        assert_eq!(app.connection(), Connection::Connecting);
+
+        // One message is enough to leave it: record() sets the last arrival, so
+        // the connection reads live even before there are gaps to judge a stall.
+        tx.send(Update::Envelope(Box::new(envelope(true)))).unwrap();
+        app.drain();
+        assert_eq!(app.connection(), Connection::Live);
+    }
+
+    #[test]
+    fn connection_reflects_stream_and_cadence() {
+        let (_tx, rx) = mpsc::channel::<Update>();
+        let mut app = App::new(rx, LogBuffer::default(), false);
+
+        // No message yet: still coming up.
+        assert_eq!(app.connection(), Connection::Connecting);
+
+        // A steady 1s cadence, last message just now: live.
+        let steady = [1.0, 1.0, 1.0, 1.0];
+        app.cadence = Cadence::from_parts(steady, Some(Instant::now()));
+        assert_eq!(app.connection(), Connection::Live);
+
+        // The same cadence gone quiet for 5s: an outlier, so stalling.
+        app.cadence = Cadence::from_parts(
+            steady,
+            Some(Instant::now() - Duration::from_secs(5)),
         );
+        assert_eq!(app.connection(), Connection::Stalling);
+
+        // A dead stream wins over everything else.
+        app.stream_ended = true;
+        assert_eq!(app.connection(), Connection::Stopped);
     }
 
     #[test]
