@@ -22,7 +22,7 @@ gui = [
 ]
 
 [dependencies]
-elite_journal = "0.5"
+elite_journal = "0.6"
 serde = "1.0"
 serde_json = "1.0"
 chrono = "0.4"
