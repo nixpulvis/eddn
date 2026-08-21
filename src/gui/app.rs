@@ -5,7 +5,7 @@ use crate::cadence::Cadence;
 use crate::feed::{event_label, schema_family, system_text, Feed};
 use crate::log_pane::{LogBuffer, LogLine};
 use crate::worker::Update;
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use eddn::{Envelope, Galaxy, Message};
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -22,6 +22,20 @@ const ROW_HEIGHT: f32 = 18.0;
 /// How a UTC timestamp is spelled wherever the window shows one: the live
 /// clock and every row's gateway time, so the two read the same and line up.
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%SZ";
+
+/// The same format in local time: no `Z`, since the value is no longer UTC.
+const LOCAL_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// A UTC instant spelled for display: UTC with a `Z`, or the machine's local
+/// time without one when `local` is set. The wall clock and both time columns
+/// all read through here, so flipping the toggle moves them together.
+fn format_time(when: DateTime<Utc>, local: bool) -> String {
+    if local {
+        when.with_timezone(&Local).format(LOCAL_FORMAT).to_string()
+    } else {
+        when.format(TIMESTAMP_FORMAT).to_string()
+    }
+}
 
 /// The window's state: everything a frame draws from and remembers between them.
 pub struct App {
@@ -56,6 +70,11 @@ pub struct App {
     /// Set when the follow button is pressed, to scroll back to the newest row
     /// and resume tailing. Consumed the frame it is read.
     follow_latest: bool,
+
+    /// Whether timestamps read in local time instead of UTC. On by default for
+    /// casual reading; the toggle switches to UTC, which matches the gateway.
+    /// Flips the wall clock and both time columns together so they line up.
+    local_time: bool,
 
     /// While scrolled up from the live edge, the top-of-view message by
     /// sequence number and the pixels it sits scrolled past
@@ -120,6 +139,7 @@ impl App {
             columns: default_columns(test_enabled),
             show_log: false,
             follow_latest: false,
+            local_time: true,
             feed_anchor: None,
             cadence: Cadence::default(),
             stream_ended: false,
@@ -315,11 +335,13 @@ impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("status").show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                // The wall clock, UTC to match the gateway timestamps in the
-                // feed's time column, so how current the feed is reads at a
-                // glance. The frame already repaints once a second (see `ui`),
-                // so it ticks without any clock of its own.
-                ui.monospace(Utc::now().format(TIMESTAMP_FORMAT).to_string());
+                // The wall clock, in the same zone as the feed's time columns
+                // -- local by default, or UTC with the toggle off -- so the two
+                // read the same and how current the feed is shows at a glance.
+                // The frame repaints once a second (see `ui`), so it ticks
+                // without a clock of its own.
+                ui.monospace(format_time(Utc::now(), self.local_time));
+                ui.checkbox(&mut self.local_time, "local time");
                 ui.separator();
                 // Connection health at a glance, so a stall or a dead stream
                 // shows without opening the log. Painted rather than a glyph,
@@ -546,6 +568,7 @@ impl App {
             let feed_anchor = &mut self.feed_anchor;
             let view = self.view;
             let follow = self.follow_latest;
+            let local = self.local_time;
 
             // The columns actually drawn. The table, its header and its rows
             // are all built by walking this one list, so they never fall out
@@ -653,7 +676,7 @@ impl App {
                                         stroke,
                                     );
                                 }
-                                field.cell(ui, envelope);
+                                field.cell(ui, envelope, local);
                             });
                         }
                         // The cells already sense clicks (Sense::click on the
@@ -800,22 +823,19 @@ impl Field {
     }
 
     /// Draw one cell of this column
-    fn cell(self, ui: &mut egui::Ui, envelope: &Envelope) {
+    fn cell(self, ui: &mut egui::Ui, envelope: &Envelope, local: bool) {
         match self {
             Field::GatewayTime => {
-                ui.monospace(
-                    envelope
-                        .header
-                        .gateway_timestamp
-                        .format(TIMESTAMP_FORMAT)
-                        .to_string(),
-                );
+                ui.monospace(format_time(
+                    envelope.header.gateway_timestamp,
+                    local,
+                ));
             }
             Field::JournalTime => {
                 let text = envelope
                     .message
                     .timestamp()
-                    .map(|event| event.format(TIMESTAMP_FORMAT).to_string())
+                    .map(|event| format_time(event, local))
                     .unwrap_or_default();
                 ui.monospace(text);
             }
@@ -1431,5 +1451,14 @@ mod tests {
         assert!(UNKNOWN_TINT.r() > UNKNOWN_TINT.g());
         assert!(UNKNOWN_TINT.r() > UNKNOWN_TINT.b());
         assert_ne!(category_tint("Scan", true), UNKNOWN_TINT);
+    }
+
+    #[test]
+    fn a_time_reads_utc_with_a_z_and_local_without() {
+        let when: DateTime<Utc> =
+            "2026-08-20T12:00:00Z".parse().expect("fixture parses");
+        assert_eq!(format_time(when, false), "2026-08-20 12:00:00Z");
+        // Local's digits depend on the machine's zone; the dropped Z does not.
+        assert!(!format_time(when, true).ends_with('Z'));
     }
 }
