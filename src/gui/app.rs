@@ -366,8 +366,9 @@ fn rate_sparkline(ui: &mut egui::Ui, samples: &VecDeque<(f32, bool)>) {
     let warn = ui.visuals().warn_fg_color;
     let wash =
         egui::Color32::from_rgba_unmultiplied(warn.r(), warn.g(), warn.b(), 48);
-    for i in 0..samples.len() - 1 {
-        if samples[i].1 {
+    for (i, &(_, stalled)) in samples.iter().enumerate().take(samples.len() - 1)
+    {
+        if stalled {
             let band = egui::Rect::from_x_y_ranges(
                 egui::Rangef::new(x(i), x(i + 1)),
                 rect.y_range(),
