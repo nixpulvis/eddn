@@ -105,6 +105,14 @@ pub struct App {
     /// already follows the newest row.
     feed_anchor: Option<(u64, f32)>,
 
+    /// Feed scroll driven by the keyboard: a one-frame absolute offset set by
+    /// Page Up/Down, plus last frame's offset, max and viewport height it is
+    /// figured from. Throwaway once egui owns the scroll (see the scroll plan).
+    scroll_target: Option<f32>,
+    scroll_offset: f32,
+    scroll_max: f32,
+    scroll_page: f32,
+
     /// The feed's arrival timing: the rate shown in the status bar and the
     /// statistics behind the connection dot. See [`Cadence`].
     cadence: Cadence,
@@ -157,6 +165,10 @@ impl App {
             follow_latest: false,
             local_time: true,
             feed_anchor: None,
+            scroll_target: None,
+            scroll_offset: 0.0,
+            scroll_max: 0.0,
+            scroll_page: 0.0,
             cadence: Cadence::default(),
             stream_ended: false,
             last_frame: None,
@@ -296,6 +308,7 @@ impl eframe::App for App {
             }
         });
 
+        self.shortcuts(ui.ctx());
         self.status_bar(ui);
         self.log_panel(ui);
         self.detail_panel(ui);
@@ -347,7 +360,111 @@ fn rate_sparkline(ui: &mut egui::Ui, samples: &VecDeque<(f32, bool)>) {
     response.on_hover_text(format!("peak {peak:.0}/s over {}s", samples.len()));
 }
 
+/// The feed-steering keys read in a single input pass, so the input lock is
+/// taken once up front and acting on them -- which needs the memory lock or
+/// `self` -- happens after it is released.
+#[derive(Clone, Copy)]
+struct FeedKeys {
+    slash: bool,
+    delete: bool,
+    end: bool,
+    home: bool,
+    up: bool,
+    down: bool,
+    page_up: bool,
+    page_down: bool,
+}
+
 impl App {
+    /// Keyboard shortcuts, read once a frame before the panels draw
+    ///
+    /// Ctrl/Cmd+F or `/` focus the query box; Escape backs out a step at a time
+    /// -- a focused field, then the detail, then the log. The rest steer the
+    /// feed and fire only when nothing is focused, so they never fight text
+    /// entry: Delete clears both roles, End follows the live edge, Home jumps to
+    /// the oldest, Up/Down (or vi `k`/`j`) scroll a row, and Page Up/Down (or vi
+    /// Ctrl+U/Ctrl+D) scroll a viewport.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let pitch = ROW_HEIGHT + ctx.global_style().spacing.item_spacing.y;
+        let focused = ctx.memory(|m| m.focused());
+
+        let focus_query =
+            ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F));
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        // Everything past focus and escape steers the feed, so it is read only
+        // when nothing is focused -- otherwise `j`, `/` and the like are text.
+        let keys = if focused.is_some() {
+            None
+        } else {
+            Some(ctx.input(|i| FeedKeys {
+                slash: i.key_pressed(egui::Key::Slash),
+                delete: i.key_pressed(egui::Key::Delete),
+                end: i.key_pressed(egui::Key::End),
+                home: i.key_pressed(egui::Key::Home),
+                up: i.key_pressed(egui::Key::ArrowUp)
+                    || i.key_pressed(egui::Key::K),
+                down: i.key_pressed(egui::Key::ArrowDown)
+                    || i.key_pressed(egui::Key::J),
+                page_up: i.key_pressed(egui::Key::PageUp)
+                    || (i.modifiers.command && i.key_pressed(egui::Key::U)),
+                page_down: i.key_pressed(egui::Key::PageDown)
+                    || (i.modifiers.command && i.key_pressed(egui::Key::D)),
+            }))
+        };
+
+        if focus_query || keys.is_some_and(|k| k.slash) {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("query_box")));
+            // Drop the '/' text event, or the box egui just focused types it.
+            ctx.input_mut(|i| {
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::Text(t) if t == "/"));
+            });
+        }
+        if escape {
+            if let Some(id) = focused {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            } else if self.selected.is_some() {
+                self.selected = None;
+            } else {
+                self.show_log = false;
+            }
+        }
+
+        let Some(keys) = keys else { return };
+        if keys.delete {
+            self.filter.clear();
+            self.watch.clear();
+        }
+        if keys.end {
+            self.follow_latest = true;
+        }
+        if keys.home {
+            self.scroll_target = Some(0.0);
+        }
+        // Relative scrolls accumulate into one clamped move off the current
+        // offset, and drop out of following since they leave the live edge.
+        let mut delta = 0.0;
+        if keys.up {
+            delta -= pitch;
+        }
+        if keys.down {
+            delta += pitch;
+        }
+        if keys.page_up {
+            delta -= self.scroll_page;
+        }
+        if keys.page_down {
+            delta += self.scroll_page;
+        }
+        if delta != 0.0 {
+            self.follow_latest = false;
+            let base = self.scroll_target.unwrap_or(self.scroll_offset);
+            self.scroll_target =
+                Some((base + delta).clamp(0.0, self.scroll_max));
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("status").show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -451,6 +568,7 @@ impl App {
                 let width = ui.spacing().text_edit_width * 0.5;
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
+                        .id(egui::Id::new("query_box"))
                         .desired_width(width),
                 );
                 // Enter applies the box as a filter, the common case; the watch
@@ -623,6 +741,10 @@ impl App {
             let view = self.view;
             let follow = self.follow_latest;
             let local = self.local_time;
+            let scroll_target = self.scroll_target.take();
+            let scroll_offset = &mut self.scroll_offset;
+            let scroll_max = &mut self.scroll_max;
+            let scroll_page = &mut self.scroll_page;
             let watch = watch_matchers(&self.watch);
             let watch_seq = &mut self.watch_seq;
 
@@ -682,12 +804,16 @@ impl App {
             // The pitch egui_extras scrolls by: a row plus the gap under it.
             let pitch = ROW_HEIGHT + ui.spacing().item_spacing.y;
 
+            // Stick to the live edge only when we mean to tail -- following, or
+            // sitting at the bottom with no anchor. While paging or holding a
+            // scrolled-up spot, sticking would drag the offset back down.
+            let stick =
+                follow || (scroll_target.is_none() && feed_anchor.is_none());
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
-                // Tail the feed: newest at the bottom, following new messages
-                // while at the live edge.
-                .stick_to_bottom(true)
+                // Tail the feed: newest at the bottom (see `stick` above).
+                .stick_to_bottom(stick)
                 // The feed is clicked, not dragged. With drag-to-scroll on, a
                 // click that shifts a pixel is read as a scroll: the view moves
                 // and the anchor that holds it still is lost, so a click near
@@ -698,7 +824,9 @@ impl App {
             for &field in &shown {
                 table = table.column(field.column());
             }
-            if follow {
+            if let Some(target) = scroll_target {
+                table = table.vertical_scroll_offset(target);
+            } else if follow {
                 // Scroll animation is off (set in `ui`), so this jumps straight
                 // to the newest row; stick_to_bottom then keeps tailing.
                 table = table.scroll_to_row(
@@ -791,6 +919,9 @@ impl App {
             let max_offset =
                 (output.content_size.y - output.inner_rect.height()).max(0.0);
             *feed_anchor = top_anchor(&rows, settled, max_offset, pitch);
+            *scroll_offset = settled;
+            *scroll_max = max_offset;
+            *scroll_page = output.inner_rect.height();
         });
     }
 }
