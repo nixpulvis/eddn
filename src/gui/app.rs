@@ -51,6 +51,9 @@ pub struct App {
     /// Substring matched against a row's schema, event, system, body, station
     /// and uploader; independent of which columns are shown.
     filter: String,
+    /// The [`filter`](Self::filter) compiled to a matcher, rebuilt only when
+    /// the text changes so a frame reads it rather than recompiling the regex.
+    filter_matcher: Matcher,
 
     /// Substrings to alert on, comma-separated, matched like the filter but
     /// raising attention instead of hiding: a match tints the row, counts in
@@ -59,6 +62,9 @@ pub struct App {
     /// The highest message sequence checked for a watch flash, so only a
     /// genuinely new arrival raises attention, never a row already on screen.
     watch_seq: u64,
+    /// The [`watch`](Self::watch) terms compiled to matchers, rebuilt only when
+    /// the text changes, like [`filter_matcher`](Self::filter_matcher).
+    watches: Vec<Matcher>,
     /// Whether test data is enabled (the `--test` flag): the subscription
     /// carries both galaxies, the live column and the live/test filters show,
     /// and non-live events appear. Without it only live events arrive.
@@ -104,6 +110,11 @@ pub struct App {
     /// layout. [`None`] while tailing the bottom, where sticking to the bottom
     /// already follows the newest row.
     feed_anchor: Option<(u64, f32)>,
+    /// The displayed rows, rebuilt each frame into a buffer kept here so a
+    /// frame reuses the last one's capacity instead of allocating anew. Each is
+    /// a row's sequence number -- which [`top_anchor`]/[`anchor_offset`] track
+    /// across eviction -- and the [metadata](RowMeta) a cell draws from.
+    feed_rows: Vec<(u64, RowMeta)>,
 
     /// Feed scroll driven by the keyboard: a one-frame absolute offset set by
     /// Page Up/Down, plus last frame's offset, max and viewport height it is
@@ -154,9 +165,11 @@ impl App {
             updates,
             log,
             filter: String::new(),
+            filter_matcher: Matcher::new(""),
             query: String::new(),
             watch: String::new(),
             watch_seq: 0,
+            watches: Vec::new(),
             test_enabled,
             view: if test_enabled { Galaxy::TEST } else { Galaxy::ALL },
             selected: None,
@@ -165,6 +178,7 @@ impl App {
             follow_latest: false,
             local_time: true,
             feed_anchor: None,
+            feed_rows: Vec::new(),
             scroll_target: None,
             scroll_offset: 0.0,
             scroll_max: 0.0,
@@ -210,6 +224,20 @@ impl App {
         } else {
             Connection::Online
         }
+    }
+
+    /// Replace the filter and recompile its matcher, so a frame reads a ready
+    /// matcher instead of recompiling the regex each time it draws.
+    fn set_filter(&mut self, text: String) {
+        self.filter_matcher = Matcher::new(&text);
+        self.filter = text;
+    }
+
+    /// Replace the watch terms and recompile their matchers, for the same
+    /// reason as [`set_filter`](Self::set_filter).
+    fn set_watch(&mut self, text: String) {
+        self.watches = watch_matchers(&text);
+        self.watch = text;
     }
 }
 
@@ -433,8 +461,8 @@ impl App {
 
         let Some(keys) = keys else { return };
         if keys.delete {
-            self.filter.clear();
-            self.watch.clear();
+            self.set_filter(String::new());
+            self.set_watch(String::new());
         }
         if keys.end {
             self.follow_latest = true;
@@ -577,7 +605,8 @@ impl App {
                 if response.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
                 {
-                    self.filter = std::mem::take(&mut self.query);
+                    let query = std::mem::take(&mut self.query);
+                    self.set_filter(query);
                     response.request_focus();
                 }
                 if ui
@@ -591,7 +620,8 @@ impl App {
                     })
                     .clicked()
                 {
-                    self.filter = std::mem::take(&mut self.query);
+                    let query = std::mem::take(&mut self.query);
+                    self.set_filter(query);
                 }
                 if ui
                     .selectable_label(!self.watch.is_empty(), "watch")
@@ -604,7 +634,8 @@ impl App {
                     })
                     .clicked()
                 {
-                    self.watch = std::mem::take(&mut self.query);
+                    let query = std::mem::take(&mut self.query);
+                    self.set_watch(query);
                 }
                 if self.test_enabled {
                     ui.separator();
@@ -735,7 +766,7 @@ impl App {
             // different fields.
             let feed = &self.feed;
             let selected = &mut self.selected;
-            let filter = &self.filter;
+            let filter = &self.filter_matcher;
             let columns = &self.columns;
             let feed_anchor = &mut self.feed_anchor;
             let view = self.view;
@@ -745,8 +776,9 @@ impl App {
             let scroll_offset = &mut self.scroll_offset;
             let scroll_max = &mut self.scroll_max;
             let scroll_page = &mut self.scroll_page;
-            let watch = watch_matchers(&self.watch);
+            let watches = &self.watches;
             let watch_seq = &mut self.watch_seq;
+            let feed_rows = &mut self.feed_rows;
 
             // The columns actually drawn. The table, its header and its rows
             // are all built by walking this one list, so they never fall out
@@ -763,28 +795,30 @@ impl App {
                 return;
             }
 
-            let filter = Matcher::new(filter);
             // Each row carries the sequence number of its envelope -- the count
             // of envelopes pushed before it -- so a row keeps its identity as
             // the ring drops old ones out from under the shifting indices.
             let evicted = feed.received() - feed.retained() as u64;
-            let mut rows: Vec<(u64, &Envelope)> = Vec::new();
-            let mut gaps: Vec<Option<Duration>> = Vec::new();
-            let mut matches: Vec<bool> = Vec::new();
-            let mut new_hit = false;
+            // Rebuild the displayed rows into the buffer kept on the app, so a
+            // frame reuses last frame's capacity rather than allocating anew.
+            // Each row is its sequence and the metadata a cell draws from: where
+            // its envelope sits in the feed's window, the gap it followed, and
+            // whether a watch matched it.
+            feed_rows.clear();
+            let mut alert = WatchAlert::new(*watch_seq);
             for (index, (envelope, search, gap)) in feed.rows().enumerate() {
                 let seq = evicted + index as u64;
-                let hit = watch_hit(search, &watch);
-                if hit && seq > *watch_seq {
-                    new_hit = true;
-                }
+                let hit = watch_hit(search, watches);
+                alert.observe(seq, hit);
                 if view.shows(envelope.live) && filter.matches(search) {
-                    rows.push((seq, envelope));
-                    gaps.push(gap);
-                    matches.push(hit);
+                    feed_rows.push((
+                        seq,
+                        RowMeta { kept: index, gap, watched: hit },
+                    ));
                 }
             }
-            *watch_seq = feed.received().saturating_sub(1);
+            let (new_hit, next_watch_seq) = alert.finish(feed.received());
+            *watch_seq = next_watch_seq;
             // A new watched arrival while the window is in the background
             // flashes the taskbar or dock; egui clears it when focus returns.
             if new_hit && !ui.ctx().input(|i| i.focused) {
@@ -830,14 +864,17 @@ impl App {
                 // Scroll animation is off (set in `ui`), so this jumps straight
                 // to the newest row; stick_to_bottom then keeps tailing.
                 table = table.scroll_to_row(
-                    rows.len().saturating_sub(1),
+                    feed_rows.len().saturating_sub(1),
                     Some(egui::Align::BOTTOM),
                 );
             } else if let Some((anchor, frac)) = *feed_anchor {
                 // Scrolled up: hold the remembered message where it was, so
                 // eviction cannot slide the view over the feed.
                 table = table.vertical_scroll_offset(anchor_offset(
-                    &rows, anchor, frac, pitch,
+                    feed_rows.as_slice(),
+                    anchor,
+                    frac,
+                    pitch,
                 ));
             }
 
@@ -850,11 +887,12 @@ impl App {
                     }
                 })
                 .body(|body| {
-                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                    body.rows(ROW_HEIGHT, feed_rows.len(), |mut row| {
                         let index = row.index();
-                        let (_, envelope) = rows[index];
-                        let gap = gaps[index];
-                        let watched_row = matches[index];
+                        let meta = feed_rows[index].1;
+                        let envelope = feed.envelope(meta.kept);
+                        let gap = meta.gap;
+                        let watched_row = meta.watched;
                         for &field in &shown {
                             row.col(|ui| {
                                 if watched_row {
@@ -918,7 +956,8 @@ impl App {
             let settled = output.state.offset.y;
             let max_offset =
                 (output.content_size.y - output.inner_rect.height()).max(0.0);
-            *feed_anchor = top_anchor(&rows, settled, max_offset, pitch);
+            *feed_anchor =
+                top_anchor(feed_rows.as_slice(), settled, max_offset, pitch);
             *scroll_offset = settled;
             *scroll_max = max_offset;
             *scroll_page = output.inner_rect.height();
@@ -930,6 +969,17 @@ impl App {
 struct ColumnState {
     field: Field,
     visible: bool,
+}
+
+/// Per-row metadata the feed buffer keeps beside each row's sequence number:
+/// where the envelope sits in the feed's retained window, the connection gap it
+/// followed, and whether a watch matched it. Held owned so the buffer can live
+/// on the app across frames, where a borrowed envelope could not.
+#[derive(Clone, Copy)]
+struct RowMeta {
+    kept: usize,
+    gap: Option<Duration>,
+    watched: bool,
 }
 
 /// One column of the feed table
@@ -1423,6 +1473,40 @@ fn watch_hit(search: &str, matchers: &[Matcher]) -> bool {
     matchers.iter().any(|matcher| matcher.matches(search))
 }
 
+/// The frame's watch-alert state: whether a genuinely new watched row has
+/// arrived since the last frame checked.
+///
+/// Fed every retained row -- its sequence and whether a watch matched it,
+/// before the filter, so a hidden row alerts too. Only a sequence past the last
+/// one [seen](WatchAlert::new) counts, so a row already on screen never
+/// re-alerts. [`finish`](WatchAlert::finish) reports whether to raise attention
+/// and the sequence to remember: `received - 1`, so next frame "new" means an
+/// arrival past everything this frame had.
+struct WatchAlert {
+    seen: u64,
+    new_hit: bool,
+}
+
+impl WatchAlert {
+    /// Start a frame's scan, having already checked up to `seen`.
+    fn new(seen: u64) -> Self {
+        WatchAlert { seen, new_hit: false }
+    }
+
+    /// Note a retained row's sequence and whether a watch matched it.
+    fn observe(&mut self, seq: u64, hit: bool) {
+        if hit && seq > self.seen {
+            self.new_hit = true;
+        }
+    }
+
+    /// Finish the scan: whether to raise attention, and the sequence to
+    /// remember as checked for the next frame.
+    fn finish(self, received: u64) -> (bool, u64) {
+        (self.new_hit, received.saturating_sub(1))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1734,6 +1818,25 @@ mod tests {
         assert!(!watch_hit("colonia via eddiscovery", &matchers));
         // No terms means nothing is watched.
         assert!(!watch_hit("anything", &watch_matchers("  ,  ")));
+    }
+
+    #[test]
+    fn a_watch_alert_fires_only_past_the_last_sequence_seen() {
+        // Rows already checked (<= seen) never re-alert, matched or not.
+        let mut alert = WatchAlert::new(2);
+        alert.observe(0, true);
+        alert.observe(2, true);
+        // A newer row that does not match does not alert either.
+        alert.observe(3, false);
+        let (new_hit, seen) = alert.finish(4);
+        assert!(!new_hit);
+        // Seen advances to the newest pushed, so next frame starts past it.
+        assert_eq!(seen, 3);
+
+        // A match past the seen mark trips the alert.
+        let mut alert = WatchAlert::new(2);
+        alert.observe(3, true);
+        assert_eq!(alert.finish(5), (true, 4));
     }
 
     #[test]

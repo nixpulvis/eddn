@@ -275,6 +275,15 @@ impl Feed {
         self.kept.len()
     }
 
+    /// The envelope at `index` in the retained window, oldest first
+    ///
+    /// Paired with [`rows`](Feed::rows), whose enumeration gives the index: the
+    /// feed's display buffer keeps a row's index rather than a borrow, and
+    /// resolves the envelope through here when a cell draws it.
+    pub fn envelope(&self, index: usize) -> &Envelope {
+        &self.kept[index].envelope
+    }
+
     /// How much time the retained window spans
     ///
     /// The gap between the oldest kept envelope's gateway timestamp and the
