@@ -133,12 +133,10 @@ impl App {
     fn drain(&mut self) {
         loop {
             match self.updates.try_recv() {
-                Ok(envelope) => {
-                    match self.cadence.record(Instant::now()) {
-                        Some(gap) => self.feed.push_after_gap(*envelope, gap),
-                        None => self.feed.push(*envelope),
-                    }
-                }
+                Ok(envelope) => match self.cadence.record(Instant::now()) {
+                    Some(gap) => self.feed.push_after_gap(*envelope, gap),
+                    None => self.feed.push(*envelope),
+                },
                 Err(TryRecvError::Empty) => break,
                 // Every sender gone means the worker thread has stopped. It only
                 // ends by unwinding, since subscribe() never returns, so the
@@ -357,7 +355,10 @@ impl App {
                 }
                 ui.separator();
                 rate_sparkline(ui, self.cadence.samples());
-                ui.label(format!("{:.1}/s", self.cadence.rate()));
+                ui.monospace(format!("{:>5.1}/s", self.cadence.rate()));
+                if let Some(span) = self.feed.window_duration() {
+                    ui.label(format!("span {}", format_span(span)));
+                }
                 ui.label(match self.cadence.last() {
                     Some(at) => {
                         format!("last {:.0}s ago", at.elapsed().as_secs_f64())
@@ -368,17 +369,36 @@ impl App {
                 let received =
                     ui.label(format!("received {}", self.feed.received()));
                 if !self.feed.per_schema().is_empty() {
-                    received.on_hover_ui(|ui| {
-                        for (family, count) in self.feed.per_schema() {
-                            ui.label(
-                                RichText::new(format!("{count:>6}  {family}"))
+                    received
+                        .on_hover_cursor(egui::CursorIcon::Help)
+                        .on_hover_ui(|ui| {
+                            for (family, count) in self.feed.per_schema() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{count:>6}  {family}"
+                                    ))
                                     .monospace(),
-                            );
-                        }
-                    });
+                                );
+                            }
+                        });
                 }
-                if let Some(span) = self.feed.window_duration() {
-                    ui.label(format!("span {}", format_span(span)));
+                let software = ui.label(format!(
+                    "software {}",
+                    self.feed.per_software().len()
+                ));
+                if !self.feed.per_software().is_empty() {
+                    software
+                        .on_hover_cursor(egui::CursorIcon::Help)
+                        .on_hover_ui(|ui| {
+                            for (name, count) in self.feed.per_software() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{count:>6}  {name}"
+                                    ))
+                                    .monospace(),
+                                );
+                            }
+                        });
                 }
                 ui.separator();
                 if ui.button("follow").clicked() {
@@ -620,7 +640,8 @@ impl App {
                                 // content, so it tracks the rows rather than
                                 // lagging a frame behind as a separate layer
                                 // would.
-                                if gap.is_some() && field == Field::GatewayTime {
+                                if gap.is_some() && field == Field::GatewayTime
+                                {
                                     let rect = ui.max_rect();
                                     let stroke = egui::Stroke::new(
                                         2.0_f32,
@@ -764,7 +785,10 @@ impl Field {
     /// themselves and carry no searchable text.
     fn text(self, envelope: &Envelope) -> Option<String> {
         match self {
-            Field::GatewayTime | Field::JournalTime | Field::Live | Field::Delta => None,
+            Field::GatewayTime
+            | Field::JournalTime
+            | Field::Live
+            | Field::Delta => None,
             Field::System => Some(system_text(envelope)),
             Field::Body => envelope.body.clone(),
             Field::Station => envelope.station.clone(),
@@ -818,6 +842,19 @@ impl Field {
                     egui::Sense::hover(),
                 );
                 ui.painter().circle_filled(rect.center(), 4.0, color);
+            }
+            Field::Schema | Field::Event => {
+                // The tint keys off the very text the cell shows, which is the
+                // same string the filter searches, so colour, text and filter
+                // are one reading and cannot drift.
+                let text = self.text(envelope).unwrap_or_default();
+                let tint = category_tint(&text, ui.visuals().dark_mode);
+                ui.painter().rect_filled(
+                    ui.max_rect(),
+                    egui::CornerRadius::ZERO,
+                    tint,
+                );
+                ui.label(text);
             }
             _ => {
                 ui.label(self.text(envelope).unwrap_or_default());
@@ -890,6 +927,218 @@ fn top_anchor<T>(
     }
     let top = ((settled / pitch).floor() as usize).min(rows.len() - 1);
     Some((rows[top].0, settled - top as f32 * pitch))
+}
+
+/// The full rendering of an envelope for the detail pane
+fn detail(envelope: &Envelope) -> String {
+    let mut text = String::new();
+    let _ = writeln!(text, "schema:   {}", envelope.schema_ref);
+    let _ = writeln!(text, "live:     {}", envelope.live);
+    if let Some(system) = &envelope.star_system {
+        let _ = writeln!(text, "system:   {}", system);
+    }
+    if let Some(version) = &envelope.version {
+        let _ = writeln!(text, "version:  {}", version);
+    }
+    let _ = writeln!(
+        text,
+        "software: {} {}",
+        envelope.header.software_name, envelope.header.software_version
+    );
+    let _ = writeln!(text, "uploader: {}", envelope.header.uploader_id);
+    let _ = writeln!(
+        text,
+        "gateway:  {}",
+        envelope.header.gateway_timestamp.to_rfc3339()
+    );
+    let _ = writeln!(text);
+
+    match &envelope.message {
+        Message::Unmodeled(value) => {
+            let _ = writeln!(
+                text,
+                "{}",
+                to_string_pretty(value)
+                    .unwrap_or_else(|_| format!("{:?}", value))
+            );
+        }
+        modeled => {
+            let _ = writeln!(text, "{:#?}", modeled);
+        }
+    }
+    text
+}
+
+/// A status-bar count, coloured by its severity, that opens the log on click
+///
+/// Errors and warnings both lead only to the log -- their details never go
+/// anywhere else -- so the count is the way in rather than a dead end. Returns
+/// whether it was clicked.
+fn log_link(ui: &mut egui::Ui, text: RichText) -> bool {
+    ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("open the log")
+        .clicked()
+}
+
+/// A compact rendering of how long the retained window spans, e.g. `2m41s`
+fn format_span(span: chrono::Duration) -> String {
+    let secs = span.num_seconds().max(0);
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// The gateway-minus-event span, e.g. `2m41s`, or `-3s` where the sender's
+/// clock runs ahead of the gateway's
+///
+/// [`format_span`] floors at zero, so the sign is carried here: without it a
+/// clock skew that makes the gateway look earlier than the event would read as
+/// `0s` rather than showing that it happened.
+fn format_delta(delta: chrono::Duration) -> String {
+    if delta.num_seconds() < 0 {
+        format!("-{}", format_span(-delta))
+    } else {
+        format_span(delta)
+    }
+}
+
+/// A panel's header: its title, and a button beside it to close the panel.
+///
+/// Returns whether that button was clicked, left for the caller to act on once
+/// it has finished borrowing the panel's own contents.
+fn panel_header(ui: &mut egui::Ui, title: RichText, close: &str) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(title);
+        ui.button(close).clicked()
+    })
+    .inner
+}
+
+/// The colour a log line is drawn in, chosen by its level.
+fn level_color(level: Level) -> Color32 {
+    match level {
+        Level::ERROR => Color32::LIGHT_RED,
+        Level::WARN => Color32::from_rgb(255, 200, 80),
+        Level::INFO => Color32::LIGHT_GREEN,
+        Level::DEBUG => Color32::LIGHT_BLUE,
+        Level::TRACE => Color32::GRAY,
+    }
+}
+
+/// The colour group a schema family or event name belongs to
+///
+/// Grouping is what lets a run of kindred messages read as one band: every name
+/// in a group takes the one hue (see [`category_tint`]), and the cell's own
+/// text says which member it is. Matching is by substring and case-blind, so a
+/// PascalCase event and a lower-case schema family fall in alike --
+/// `FSSDiscoveryScan`, `SAAScanComplete` and the `fssdiscoveryscan` schema all
+/// group on a scan, while the `journal` schema keeps a colour of its own. The
+/// first keyword found, in the order below, places the name; the exploration
+/// words come before `nav` so a beacon scan reads as a scan, and `fss` catches
+/// the scanner schemas that name no scan outright (`fssbodysignals`). A name no
+/// keyword matches is `"other"`: an event or schema the crate cannot place,
+/// which [`category_tint`] paints like the unreadable. The table is a starting
+/// set, meant to grow as the feed turns up more.
+fn category_group(key: &str) -> &'static str {
+    const KEYWORDS: &[(&str, &str)] = &[
+        ("journal", "journal"),
+        ("fss", "exploration"),
+        ("scan", "exploration"),
+        ("signal", "exploration"),
+        ("codex", "exploration"),
+        ("discovery", "exploration"),
+        ("jump", "travel"),
+        ("dock", "travel"),
+        ("supercruise", "travel"),
+        ("location", "travel"),
+        ("liftoff", "travel"),
+        ("touchdown", "travel"),
+        ("approach", "travel"),
+        ("nav", "travel"),
+        ("interdict", "combat"),
+        ("bounty", "combat"),
+        ("kill", "combat"),
+        ("died", "combat"),
+        ("damage", "combat"),
+        ("attack", "combat"),
+        ("market", "trade"),
+        ("trade", "trade"),
+        ("commodity", "trade"),
+        ("mission", "missions"),
+        ("engineer", "engineering"),
+        ("module", "outfitting"),
+        ("shipyard", "outfitting"),
+        ("outfitting", "outfitting"),
+        ("powerplay", "powerplay"),
+        ("wing", "social"),
+        ("crew", "social"),
+        ("squadron", "social"),
+        ("friends", "social"),
+    ];
+    let lower = key.to_ascii_lowercase();
+    for (needle, group) in KEYWORDS {
+        if lower.contains(needle) {
+            return group;
+        }
+    }
+    "other"
+}
+
+/// The hue a colour group is drawn at, or [`None`] for one with no colour
+///
+/// The named clusters take fixed, well-spread hues -- combat red, exploration
+/// green, trade blue -- so no two read as the same basic colour and the ones
+/// that turn up together (a scan and a commodity) sit a long way apart on the
+/// wheel. A group that is none of them (`"other"`) has no hue; the caller
+/// paints it with [`UNKNOWN_TINT`] instead.
+fn group_hue(group: &str) -> Option<f32> {
+    const CLUSTERS: &[(&str, f32)] = &[
+        ("combat", 0.00),      // red
+        ("engineering", 0.08), // orange
+        ("outfitting", 0.15),  // amber
+        ("exploration", 0.33), // green
+        ("social", 0.44),      // teal
+        ("travel", 0.50),      // cyan
+        ("journal", 0.60),     // azure
+        ("trade", 0.70),       // blue
+        ("missions", 0.82),    // violet
+        ("powerplay", 0.92),   // magenta
+    ];
+    CLUSTERS.iter().find(|(name, _)| *name == group).map(|(_, hue)| *hue)
+}
+
+/// The tint for anything the crate cannot place
+///
+/// An unreadable `Unmodeled` payload and a schema family under no known
+/// category share the one loud red, so the unknown is what catches the eye
+/// rather than something to hunt for. Louder and more opaque than the muted
+/// cluster tints, and the same on either theme. (sRGBA 235, 45, 45 at ~45%,
+/// premultiplied so it can be `const`.)
+const UNKNOWN_TINT: Color32 =
+    Color32::from_rgba_premultiplied(106, 20, 20, 115);
+
+/// A background tint for a category cell, keyed by its [group](category_group)
+///
+/// Kindred schemas and events land on one hue, so a run of them reads as a
+/// single band; the cell's own text says which member it is. A group with no
+/// hue -- the unreadable and the uncategorised alike -- gets [`UNKNOWN_TINT`].
+/// The cluster tints are kept muted and keyed off the theme, tinting the row's
+/// stripe rather than fighting it.
+fn category_tint(key: &str, dark_mode: bool) -> Color32 {
+    let Some(hue) = group_hue(category_group(key)) else {
+        return UNKNOWN_TINT;
+    };
+    let hsva = if dark_mode {
+        egui::ecolor::Hsva::new(hue, 0.70, 0.95, 0.22)
+    } else {
+        egui::ecolor::Hsva::new(hue, 0.85, 0.55, 0.30)
+    };
+    Color32::from(hsva)
 }
 
 #[cfg(test)]
@@ -1114,105 +1363,73 @@ mod tests {
             .expect("delta column offered");
         assert!(!column.visible);
     }
-}
 
-/// The full rendering of an envelope for the detail pane
-fn detail(envelope: &Envelope) -> String {
-    let mut text = String::new();
-    let _ = writeln!(text, "schema:   {}", envelope.schema_ref);
-    let _ = writeln!(text, "live:     {}", envelope.live);
-    if let Some(system) = &envelope.star_system {
-        let _ = writeln!(text, "system:   {}", system);
+    #[test]
+    fn a_category_tint_bands_a_group_and_moves_with_the_theme() {
+        // One key, one colour, every frame and run.
+        assert_eq!(
+            category_tint("FSDJump", true),
+            category_tint("FSDJump", true)
+        );
+        // Same group, same colour: a run of travel reads as one band, even
+        // across events that share no name.
+        assert_eq!(
+            category_tint("FSDJump", true),
+            category_tint("Docked", true)
+        );
+        // Distinct clusters take distinct hues, and the ones that share a feed
+        // stay well apart: a commodity is blue, a scan green, a jump cyan.
+        assert_ne!(
+            category_tint("FSDJump", true),
+            category_tint("Commodity", true)
+        );
+        assert_ne!(
+            category_tint("Commodity", true),
+            category_tint("Scan", true)
+        );
+        // The theme moves the colour, matching the light/dark split.
+        assert_ne!(
+            category_tint("FSDJump", true),
+            category_tint("FSDJump", false)
+        );
     }
-    if let Some(version) = &envelope.version {
-        let _ = writeln!(text, "version:  {}", version);
+
+    #[test]
+    fn kindred_names_share_a_colour_group() {
+        // A bare event and its dressed-up kin share a substring, not a prefix,
+        // yet group together all the same.
+        assert_eq!(category_group("Scan"), category_group("FSSDiscoveryScan"));
+        assert_eq!(category_group("Scan"), category_group("SAAScanComplete"));
+        // A jump and a dock share no word at all, but both are travel.
+        assert_eq!(category_group("FSDJump"), category_group("Docked"));
+        // Unrelated kinds keep their distance.
+        assert_ne!(category_group("Scan"), category_group("Bounty"));
     }
-    let _ = writeln!(
-        text,
-        "software: {} {}",
-        envelope.header.software_name, envelope.header.software_version
-    );
-    let _ = writeln!(text, "uploader: {}", envelope.header.uploader_id);
-    let _ = writeln!(
-        text,
-        "gateway:  {}",
-        envelope.header.gateway_timestamp.to_rfc3339()
-    );
-    let _ = writeln!(text);
 
-    match &envelope.message {
-        Message::Unmodeled(value) => {
-            let _ = writeln!(
-                text,
-                "{}",
-                to_string_pretty(value)
-                    .unwrap_or_else(|_| format!("{:?}", value))
-            );
-        }
-        modeled => {
-            let _ = writeln!(text, "{:#?}", modeled);
-        }
+    #[test]
+    fn schema_families_take_the_cluster_colours() {
+        // A lower-case schema family colours like its kindred event: the
+        // scanner schemas green, a commodity schema like a commodity.
+        assert_eq!(category_group("fssdiscoveryscan"), category_group("Scan"));
+        assert_eq!(category_group("fssbodysignals"), category_group("Scan"));
+        assert_eq!(category_group("commodity"), category_group("Commodity"));
+        // The journal schema keeps a colour of its own, apart from the scans
+        // it carries.
+        assert_ne!(
+            category_tint("journal", true),
+            category_tint("fssdiscoveryscan", true)
+        );
     }
-    text
-}
 
-/// A status-bar count, coloured by its severity, that opens the log on click
-///
-/// Errors and warnings both lead only to the log -- their details never go
-/// anywhere else -- so the count is the way in rather than a dead end. Returns
-/// whether it was clicked.
-fn log_link(ui: &mut egui::Ui, text: RichText) -> bool {
-    ui.add(egui::Label::new(text).sense(egui::Sense::click()))
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("open the log")
-        .clicked()
-}
-
-/// A compact rendering of how long the retained window spans, e.g. `2m41s`
-fn format_span(span: chrono::Duration) -> String {
-    let secs = span.num_seconds().max(0);
-    if secs >= 3600 {
-        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-    } else if secs >= 60 {
-        format!("{}m{}s", secs / 60, secs % 60)
-    } else {
-        format!("{}s", secs)
-    }
-}
-
-/// The gateway-minus-event span, e.g. `2m41s`, or `-3s` where the sender's
-/// clock runs ahead of the gateway's
-///
-/// [`format_span`] floors at zero, so the sign is carried here: without it a
-/// clock skew that makes the gateway look earlier than the event would read as
-/// `0s` rather than showing that it happened.
-fn format_delta(delta: chrono::Duration) -> String {
-    if delta.num_seconds() < 0 {
-        format!("-{}", format_span(-delta))
-    } else {
-        format_span(delta)
-    }
-}
-
-/// A panel's header: its title, and a button beside it to close the panel.
-///
-/// Returns whether that button was clicked, left for the caller to act on once
-/// it has finished borrowing the panel's own contents.
-fn panel_header(ui: &mut egui::Ui, title: RichText, close: &str) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(title);
-        ui.button(close).clicked()
-    })
-    .inner
-}
-
-/// The colour a log line is drawn in, chosen by its level.
-fn level_color(level: Level) -> Color32 {
-    match level {
-        Level::ERROR => Color32::LIGHT_RED,
-        Level::WARN => Color32::from_rgb(255, 200, 80),
-        Level::INFO => Color32::LIGHT_GREEN,
-        Level::DEBUG => Color32::LIGHT_BLUE,
-        Level::TRACE => Color32::GRAY,
+    #[test]
+    fn the_unplaceable_share_one_loud_red() {
+        // An unreadable payload and a schema under no category get the one
+        // red, so the unknown is the thing that catches the eye.
+        assert_eq!(category_tint("Unmodeled", true), UNKNOWN_TINT);
+        assert_eq!(category_tint("some_future_schema", true), UNKNOWN_TINT);
+        // It is red, and unlike any placed cluster.
+        assert!(UNKNOWN_TINT.r() > UNKNOWN_TINT.g());
+        assert!(UNKNOWN_TINT.r() > UNKNOWN_TINT.b());
+        assert_ne!(category_tint("Scan", true), UNKNOWN_TINT);
     }
 }

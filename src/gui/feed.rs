@@ -66,6 +66,7 @@ pub struct Feed {
     kept: VecDeque<Kept>,
     received: u64,
     per_schema: BTreeMap<String, u64>,
+    per_software: BTreeMap<String, u64>,
     systems: Tally<i64>,
     bodies: Tally<(i64, i16)>,
     stations: Tally<i64>,
@@ -102,6 +103,7 @@ impl Feed {
             kept: VecDeque::new(),
             received: 0,
             per_schema: BTreeMap::new(),
+            per_software: BTreeMap::new(),
             systems: Tally::default(),
             bodies: Tally::default(),
             stations: Tally::default(),
@@ -124,6 +126,10 @@ impl Feed {
         *self
             .per_schema
             .entry(schema_family(&envelope.schema_ref).to_owned())
+            .or_insert(0) += 1;
+        *self
+            .per_software
+            .entry(envelope.header.software_name.clone())
             .or_insert(0) += 1;
 
         self.tally_objects(&envelope.message, envelope.live);
@@ -295,6 +301,16 @@ impl Feed {
     /// split is deliberate; making it galaxy-aware would break that identity.
     pub fn per_schema(&self) -> &BTreeMap<String, u64> {
         &self.per_schema
+    }
+
+    /// Everything pushed, tallied by uploader software, in name order
+    ///
+    /// The same volume total as [`per_schema`](Feed::per_schema), keyed by
+    /// `header.software_name` instead: which uploaders the feed comes through
+    /// -- EDMC, EDDiscovery and the rest -- rather than what kind of message.
+    /// All-galaxy and monotonic for the same reasons.
+    pub fn per_software(&self) -> &BTreeMap<String, u64> {
+        &self.per_software
     }
 }
 
@@ -640,5 +656,18 @@ mod tests {
         assert!(search.contains("daedalus"), "station: {search}");
         assert!(search.contains("sol a 3"), "body: {search}");
         assert!(search.contains("uploaderxyz"), "uploader: {search}");
+    }
+
+    #[test]
+    fn per_software_tallies_by_uploader() {
+        let mut feed = Feed::new(4);
+        for name in ["EDMC", "EDDiscovery", "EDMC"] {
+            let mut env = envelope("https://eddn.edcd.io/schemas/journal/1");
+            env.header.software_name = name.to_owned();
+            feed.push(env);
+        }
+        // A volume total by uploader, as per_schema is by family.
+        assert_eq!(feed.per_software().get("EDMC"), Some(&2));
+        assert_eq!(feed.per_software().get("EDDiscovery"), Some(&1));
     }
 }
