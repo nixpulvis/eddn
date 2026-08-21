@@ -9,6 +9,7 @@ use chrono::{DateTime, Local, Utc};
 use eddn::{Envelope, Galaxy, Message};
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
+use regex::{Regex, RegexBuilder};
 use serde_json::to_string_pretty;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -43,9 +44,21 @@ pub struct App {
     updates: Receiver<Update>,
     log: LogBuffer,
 
+    /// The single input box's text, applied to `filter` or `watch` by its
+    /// button and then cleared for the next entry.
+    query: String,
+
     /// Substring matched against a row's schema, event, system, body, station
     /// and uploader; independent of which columns are shown.
     filter: String,
+
+    /// Substrings to alert on, comma-separated, matched like the filter but
+    /// raising attention instead of hiding: a match tints the row, counts in
+    /// the status bar, and flashes the window while it is in the background.
+    watch: String,
+    /// The highest message sequence checked for a watch flash, so only a
+    /// genuinely new arrival raises attention, never a row already on screen.
+    watch_seq: u64,
     /// Whether test data is enabled (the `--test` flag): the subscription
     /// carries both galaxies, the live column and the live/test filters show,
     /// and non-live events appear. Without it only live events arrive.
@@ -133,6 +146,9 @@ impl App {
             updates,
             log,
             filter: String::new(),
+            query: String::new(),
+            watch: String::new(),
+            watch_seq: 0,
             test_enabled,
             view: if test_enabled { Galaxy::TEST } else { Galaxy::ALL },
             selected: None,
@@ -432,8 +448,46 @@ impl App {
             });
 
             ui.horizontal(|ui| {
-                ui.label("filter");
-                ui.text_edit_singleline(&mut self.filter);
+                let width = ui.spacing().text_edit_width * 0.5;
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.query)
+                        .desired_width(width),
+                );
+                // Enter applies the box as a filter, the common case; the watch
+                // button covers the other. Keep focus so the next entry follows
+                // without reaching for the mouse.
+                if response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    self.filter = std::mem::take(&mut self.query);
+                    response.request_focus();
+                }
+                if ui
+                    .selectable_label(!self.filter.is_empty(), "filter")
+                    .on_hover_text(match self.filter.as_str() {
+                        "" => "apply the box as a filter (text or regex)"
+                            .to_owned(),
+                        f => format!(
+                            "filter: {f}  (apply replaces, empty clears)"
+                        ),
+                    })
+                    .clicked()
+                {
+                    self.filter = std::mem::take(&mut self.query);
+                }
+                if ui
+                    .selectable_label(!self.watch.is_empty(), "watch")
+                    .on_hover_text(match self.watch.as_str() {
+                        "" => "apply the box as a watch (text or regex)"
+                            .to_owned(),
+                        w => format!(
+                            "watch: {w}  (apply replaces, empty clears)"
+                        ),
+                    })
+                    .clicked()
+                {
+                    self.watch = std::mem::take(&mut self.query);
+                }
                 if self.test_enabled {
                     ui.separator();
                     ui.label("show:");
@@ -569,6 +623,8 @@ impl App {
             let view = self.view;
             let follow = self.follow_latest;
             let local = self.local_time;
+            let watch = watch_matchers(&self.watch);
+            let watch_seq = &mut self.watch_seq;
 
             // The columns actually drawn. The table, its header and its rows
             // are all built by walking this one list, so they never fall out
@@ -585,20 +641,36 @@ impl App {
                 return;
             }
 
-            let needle = filter.to_lowercase();
+            let filter = Matcher::new(filter);
             // Each row carries the sequence number of its envelope -- the count
             // of envelopes pushed before it -- so a row keeps its identity as
             // the ring drops old ones out from under the shifting indices.
             let evicted = feed.received() - feed.retained() as u64;
             let mut rows: Vec<(u64, &Envelope)> = Vec::new();
             let mut gaps: Vec<Option<Duration>> = Vec::new();
+            let mut matches: Vec<bool> = Vec::new();
+            let mut new_hit = false;
             for (index, (envelope, search, gap)) in feed.rows().enumerate() {
-                if view.shows(envelope.live)
-                    && (needle.is_empty() || search.contains(&needle))
-                {
-                    rows.push((evicted + index as u64, envelope));
-                    gaps.push(gap);
+                let seq = evicted + index as u64;
+                let hit = watch_hit(search, &watch);
+                if hit && seq > *watch_seq {
+                    new_hit = true;
                 }
+                if view.shows(envelope.live) && filter.matches(search) {
+                    rows.push((seq, envelope));
+                    gaps.push(gap);
+                    matches.push(hit);
+                }
+            }
+            *watch_seq = feed.received().saturating_sub(1);
+            // A new watched arrival while the window is in the background
+            // flashes the taskbar or dock; egui clears it when focus returns.
+            if new_hit && !ui.ctx().input(|i| i.focused) {
+                ui.ctx().send_viewport_cmd(
+                    egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ),
+                );
             }
 
             // Labels are selectable by default, and the text selection senses
@@ -654,8 +726,16 @@ impl App {
                         let index = row.index();
                         let (_, envelope) = rows[index];
                         let gap = gaps[index];
+                        let watched_row = matches[index];
                         for &field in &shown {
                             row.col(|ui| {
+                                if watched_row {
+                                    ui.painter().rect_filled(
+                                        ui.max_rect(),
+                                        egui::CornerRadius::ZERO,
+                                        WATCH_TINT,
+                                    );
+                                }
                                 // A row that opens after a connection gap gets a
                                 // line under its time: the same stall the status
                                 // dot flags, drawn where the feed picked back up.
@@ -1161,6 +1241,57 @@ fn category_tint(key: &str, dark_mode: bool) -> Color32 {
     Color32::from(hsva)
 }
 
+/// The wash a watched row takes across every cell: the same gold, translucent
+/// so the row's text and category tints still read through it. Strong enough
+/// to catch the eye at a glance, which the thin marker was not.
+const WATCH_TINT: Color32 = Color32::from_rgba_premultiplied(85, 63, 20, 85);
+
+/// A compiled query: a case-insensitive regex, or a plain lower-cased
+/// substring where the pattern is not valid regex, so a stray metacharacter
+/// never breaks matching. The filter and every watch term compile to one.
+///
+/// Matched against a row's already-lower-cased search text. The regex is built
+/// case-insensitive rather than by lower-casing the pattern, which would turn a
+/// `\W` into a `\w`; an empty pattern is a valid regex that matches everything,
+/// so an empty filter shows every row.
+enum Matcher {
+    Regex(Regex),
+    Substring(String),
+}
+
+impl Matcher {
+    fn new(pattern: &str) -> Self {
+        match RegexBuilder::new(pattern).case_insensitive(true).build() {
+            Ok(regex) => Matcher::Regex(regex),
+            Err(_) => Matcher::Substring(pattern.to_lowercase()),
+        }
+    }
+
+    fn matches(&self, search: &str) -> bool {
+        match self {
+            Matcher::Regex(regex) => regex.is_match(search),
+            Matcher::Substring(text) => search.contains(text.as_str()),
+        }
+    }
+}
+
+/// The watched matchers parsed from the input: comma-separated, blanks dropped,
+/// each compiled with [`Matcher::new`]. A watch reads as a filter that alerts
+/// instead of hiding.
+fn watch_matchers(watch: &str) -> Vec<Matcher> {
+    watch
+        .split(',')
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(Matcher::new)
+        .collect()
+}
+
+/// Whether any watched matcher matches the row's search text
+fn watch_hit(search: &str, matchers: &[Matcher]) -> bool {
+    matchers.iter().any(|matcher| matcher.matches(search))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1460,5 +1591,30 @@ mod tests {
         assert_eq!(format_time(when, false), "2026-08-20 12:00:00Z");
         // Local's digits depend on the machine's zone; the dropped Z does not.
         assert!(!format_time(when, true).ends_with('Z'));
+    }
+
+    #[test]
+    fn a_watch_matches_any_of_its_matchers() {
+        let matchers = watch_matchers("Sol, EDMC ,, ");
+        assert_eq!(matchers.len(), 2);
+        // Matched case-insensitively against the lower-cased search text.
+        assert!(watch_hit("jump to sol", &matchers));
+        assert!(watch_hit("uploaded by edmc", &matchers));
+        assert!(!watch_hit("colonia via eddiscovery", &matchers));
+        // No terms means nothing is watched.
+        assert!(!watch_hit("anything", &watch_matchers("  ,  ")));
+    }
+
+    #[test]
+    fn a_matcher_takes_regex_or_falls_back_to_a_substring() {
+        // A regex matches by pattern, case-blind against the lower-cased text.
+        assert!(Matcher::new("fsd(jump|target)").matches("event fsdjump"));
+        assert!(Matcher::new("sol$").matches("jump to sol"));
+        assert!(!Matcher::new("^sol").matches("jump to sol"));
+        // An invalid regex falls back to a literal substring -- no panic.
+        assert!(Matcher::new("sol(").matches("weird sol( text"));
+        assert!(!Matcher::new("sol(").matches("no match here"));
+        // An empty pattern matches everything, so an empty filter shows all.
+        assert!(Matcher::new("").matches("anything at all"));
     }
 }
