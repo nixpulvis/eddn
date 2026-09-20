@@ -1,10 +1,10 @@
 //! A recorded feed: the wire written down, and read back as itself
 //!
-//! One subscription, any number of consumers. `galos-db` and `galos-index`
-//! each subscribing costs 17.5 KiB/s of somebody else's infrastructure
-//! apiece and gives the two of them *different* holes — two SUB sockets
-//! have their own high-water marks and their own connect times, so a
-//! restart puts a gap in one and not the other. A spool is one
+//! One subscription, any number of consumers. `galos db ingest` and `galos
+//! index ingest` each subscribing costs 17.5 KiB/s of somebody else's
+//! infrastructure apiece and gives the two of them *different* holes — two
+//! SUB sockets have their own high-water marks and their own connect times,
+//! so a restart puts a gap in one and not the other. A spool is one
 //! subscription written to disk and read by both, so the holes are shared
 //! and a crash replays rather than skips.
 //!

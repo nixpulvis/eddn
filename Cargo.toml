@@ -8,7 +8,7 @@ edition = "2021"
 
 # The recorder, and whatever reading verbs come to sit beside it. One
 # binary named for the crate, with the verb saying what it does — the way
-# `galos-db` and `galos-index` read.
+# `galos db` and `galos index` read.
 [[bin]]
 name = "eddn"
 path = "src/bin/eddn.rs"
