@@ -1,14 +1,41 @@
 //! Subscribe to journal and market messages from
-//! [EDDN](https://github.com/EDCD/EDDN).
+//! [EDDN](https://github.com/EDCD/EDDN), live or recorded.
 //!
-//! [`subscribe`] connects to the gateway and returns an iterator over the
-//! messages on it. That iterator does not end. A message that cannot be read
+//! **[`Feed`] is the seam, and there are two implementations of it.**
+//!
+//! ```text
+//!            frame()        Feed::reading()
+//!  Network ──────────┐
+//!                    ├──────────────────────> Reading
+//!  Spool   ──────────┘
+//! ```
+//!
+//! [`Network`] is the gateway's ZMQ socket; [`spool::Spool`] is a
+//! recording of one, read back off disk. They differ in
+//! [`frame`](Feed::frame) — where the bytes come from — and in nothing
+//! else: the decompress, the parse, the galaxy filter and the stamping
+//! are [`Feed::reading`], a default method written once, which both
+//! spell their `Iterator::next` as. A directory built from a spool
+//! cannot drift from one built off the wire, because there is one place
+//! that reads a frame.
+//!
+//! A consumer holds `Box<dyn Feed>` and never learns which it has — the
+//! source of messages is a constructor argument, not a shape the sinks
+//! and the shutdown path are written twice for. See
+//! `doc/PLAN-EDDN-SPOOL.md`.
+//!
+//! [`subscribe`] is `Network::open(…).envelopes()` under the name every
+//! caller written before the trait still uses: the same messages, as
+//! envelopes, with the receipt time dropped.
+//!
+//! Neither feed ends of its own accord. A message that cannot be read
 //! comes back as an [`Error`] and the next one is waited for, and a
 //! connection that has stopped working is replaced.
 
 mod connection;
 mod error;
 mod reporter;
+pub mod spool;
 
 pub use crate::connection::{
     IDLE_TIMEOUT, PING_INTERVAL, POLL_INTERVAL, RECONNECT_MAX, RECONNECT_MIN,
@@ -28,7 +55,7 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn, Level};
 
-pub const URL: &'static str = "tcp://eddn.edcd.io:9500";
+pub const URL: &str = "tcp://eddn.edcd.io:9500";
 
 /// Top level EDDN message wrapper
 #[derive(Debug)]
@@ -176,7 +203,15 @@ pub struct Header {
 /// the guess had nothing to go on. And a payload that failed to parse looked
 /// exactly like a payload that belonged to some other variant, so it fell
 /// quietly to the catchall instead of being reported.
+///
+/// **The journal variant is not boxed**, though it is most of the enum's
+/// 720 bytes and the rest are a fraction of that. Measured against what
+/// the feed does with them: 18.6 messages a second is 17 KB/s of moves,
+/// and the deepest a message is ever held is `galos-sync`'s 10,000-deep
+/// channel — 9.4 MB of `Envelope` against 4 MB boxed. Neither number is
+/// worth a `Box` in the pattern every consumer of this crate writes.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     Journal(Entry<Event>),
     Commodity(Entry<Market>),
@@ -321,77 +356,117 @@ impl<'a> Schema<'a> {
     }
 }
 
-/// Subscribe to EDDN's ZMQ socket receiving all messages
+/// One message, however it reached this process
 ///
-/// `stall_timeout` is how long the gateway may publish nothing before its
-/// connection is thrown away for a new one. `None` leaves the connection
-/// alone however long it carries nothing, giving up the only cover there is
-/// for the third case below and watching for the other two as ever.
+/// The pair a consumer is handed by any [`Feed`]: what was published, and
+/// when this process first held it. A live subscription stamps the moment
+/// it came off the socket; a recorded one replays the moment the recorder
+/// held it, unchanged, so a replay and the run it was recorded from agree
+/// about when everything happened.
+#[derive(Debug)]
+pub struct Reading {
+    pub received_at: DateTime<Utc>,
+    pub envelope: Envelope,
+}
+
+/// Where a feed would resume from, for one that can say
 ///
-/// # Connection resilience
+/// A segment and a byte offset into it — see the spool's format. A live
+/// subscription has no such thing, which is what [`Feed::resume`]
+/// answering [`None`] means: not "unknown", but "there is nowhere to
+/// resume from".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Position {
+    pub segment: String,
+    pub offset: u64,
+}
+
+/// A source of EDDN messages, in the order they were published
 ///
-/// A subscription outlives the connection carrying it. There are three ways
-/// one stops working, a different thing notices each, and all three are
-/// reported through [`tracing`] as they happen.
+/// **Two implementors, and a consumer never learns which it has.**
+/// [`Network`] is the gateway's socket; [`Spool`](crate::spool::Spool) is
+/// a recording of one, read back off disk. They carry the same messages
+/// in the same order, so which a run reads is a constructor argument
+/// rather than a shape the sinks, the publish beat and the shutdown path
+/// have to be written twice for.
 ///
-/// ## A connection that closes
+/// **An implementor supplies [`frame`](Feed::frame) and nothing else of
+/// the reading.** Everything between a frame and a [`Reading`] — the
+/// decompress, the parse, the galaxy filter — is
+/// [`reading`](Feed::reading), written here once, so a spool and a
+/// subscription cannot come to different answers about the same bytes.
+/// Both spell their `Iterator::next` as a call to it.
+pub trait Feed: Iterator<Item = Result<Reading, Error>> + Send {
+    /// One frame, exactly as it arrived, with nothing read of it.
+    ///
+    /// What a recorder writes down, and what
+    /// [`reading`](Feed::reading) reads. [`None`] ends the feed: a
+    /// subscription never answers it, and a spool does only where it was
+    /// opened to stop at the end of what was recorded.
+    fn frame(&mut self) -> Option<Result<Frame, Error>>;
+
+    /// Which galaxy's data this hands over.
+    fn showing(&self) -> Galaxy;
+
+    /// Where a restart would resume, for a feed that can say.
+    ///
+    /// [`None`] is a live subscription, which has nowhere to resume
+    /// from — not "unknown", but "there is no such place".
+    ///
+    /// **Not `position`**, which is [`Iterator`]'s and would shadow this
+    /// on every `dyn Feed` a consumer holds — the inherent method wins
+    /// and the caller gets an element search.
+    fn resume(&self) -> Option<Position> {
+        None
+    }
+
+    /// The next message: frames taken until one is worth handing over.
+    ///
+    /// A frame let go for being another galaxy's is not the end of
+    /// anything, so it reads on; a frame that will not read at all is
+    /// handed over as the [`Error`] it is, and the feed goes on after it.
+    fn reading(&mut self) -> Option<Result<Reading, Error>> {
+        let galaxy = self.showing();
+        loop {
+            match self.frame()? {
+                Ok(frame) => {
+                    if let Some(read) = frame.read(galaxy) {
+                        return Some(read);
+                    }
+                }
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+
+    /// The same messages with the receipt time dropped.
+    ///
+    /// For a caller that does not care when a message arrived — which is
+    /// what [`subscribe`] has always answered.
+    fn envelopes(self) -> Envelopes<Self>
+    where
+        Self: Sized,
+    {
+        Envelopes(self)
+    }
+}
+
+/// The same subscription, as an iterator of envelopes alone
 ///
-/// The gateway restarts, or something between here and it drops the
-/// connection and says so. The socket sees the close, throws the connection
-/// away and builds another, retrying until one takes.
-///
-/// How hard it tries is [`RECONNECT_MIN`] and [`RECONNECT_MAX`].
-///
-/// ## A connection that dies without closing
-///
-/// The machine suspends, or the gateway disappears without a word. Nothing
-/// arrives, but nothing fails either: no close comes, and a socket that only
-/// ever reads never writes anything that could fail. So it looks exactly
-/// like a working connection that happens to be quiet, and a subscriber can
-/// wait on it for as long as it runs.
-///
-/// Heartbeats tell the two apart. A ping is a write, and a connection that
-/// brings nothing back at all -- no answer to it, no data either -- runs out
-/// of time and is closed, so the case above takes over from there.
-///
-/// How long that takes is [`PING_INTERVAL`] and [`IDLE_TIMEOUT`].
-///
-/// ## A gateway that stops publishing
-///
-/// The connection is in good health and carries nothing. Pings are answered
-/// down in the gateway's socket, which knows nothing about whether the
-/// program above it is still publishing, so heartbeats report the connection
-/// as fine and are right to. Only counting the silence finds this one, which
-/// is what `stall_timeout` counts, in the gaps a receive leaves by coming
-/// back empty every [`POLL_INTERVAL`].
-///
-/// How long to give it is a question about the gateway rather than about
-/// this crate, which is why there is no default. EDDN at a busy hour carried
-/// 31 messages a second across ten minutes and never once went 0.85s without
-/// one, so a couple of minutes there is quiet that cannot happen. Somewhere
-/// thinner, it is ordinary.
+/// What this crate has always handed back, and what a caller that does
+/// not care when a message arrived still wants: `Network::open(…)
+/// .envelopes()`, spelled the way it was before there was a [`Feed`].
 pub fn subscribe(
     url: &str,
     stall_timeout: Option<Duration>,
 ) -> EnvelopeIterator {
-    let ctx = Context::new();
-    let connection = open_retrying(&ctx, url);
-
-    EnvelopeIterator {
-        ctx,
-        url: url.to_string(),
-        connection,
-        reports: Reporter::default(),
-        stall: stall_timeout.map(Stall::new),
-        galaxy: Galaxy::LIVE,
-        started: false,
-    }
+    Network::open(url, stall_timeout).envelopes()
 }
 
 /// Open a socket, waiting out failures rather than giving up on them
 ///
-/// A subscription is an infinite thing that replaces a connection forever (see
-/// [`EnvelopeIterator`]), so a socket that will not open is a wait, not a
+/// A subscription is an infinite thing that replaces a connection forever
+/// (see [`Network`]), so a socket that will not open is a wait, not a
 /// failure: each attempt that fails is logged and retried after a pause. The
 /// first connection and every replacement go through here alike, so the two
 /// behave the same and neither panics on a gateway that happens to be down.
@@ -447,28 +522,173 @@ impl Galaxy {
     }
 }
 
-/// Decompresses and parses each message from the ZMQ socket
+/// One frame off the socket, and when it arrived
 ///
-/// The iterator does not end. A message that cannot be read comes back as an
-/// [`Error`] and the next one is waited for, and a connection that stops
-/// carrying messages is replaced.
-pub struct EnvelopeIterator {
+/// The bytes are the zlib blob the gateway sent, untouched: nothing here
+/// has looked inside it, so a frame this build could not parse is still a
+/// frame and a recorder can write it down whole.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    /// When this process first held it.
+    pub received_at: DateTime<Utc>,
+    /// The compressed message, as received.
+    pub bytes: Vec<u8>,
+}
+
+impl Frame {
+    /// Read this frame into a message, or let it go
+    ///
+    /// **Everything between a frame and a [`Reading`]**: the decompress,
+    /// the parse, and the galaxy the caller asked for. A live
+    /// subscription and a replayed spool cannot come to different answers
+    /// about the same bytes, because this is the only place either of
+    /// them reads any.
+    ///
+    /// Three answers, and the third is the one worth having:
+    ///
+    /// - `Some(Ok(_))` — a message, as sent.
+    /// - `Some(Err(_))` — a frame that could not be read at all, which is
+    ///   the gateway or this crate being wrong and is worth saying.
+    /// - [`None`] — a frame deliberately let go for describing a galaxy
+    ///   the caller did not ask for. Ordinary, and silent.
+    ///
+    /// A frame let go looks exactly like a frame that never arrived, so
+    /// the difference between the last two is the one decision here that
+    /// nothing downstream can see.
+    pub fn read(&self, galaxy: Galaxy) -> Option<Result<Reading, Error>> {
+        let read = inflate::decompress_to_vec_zlib(&self.bytes)
+            .map_err(Error::Decompress)
+            .and_then(|json| {
+                serde_json::from_slice::<Envelope>(&json).map_err(|source| {
+                    // Lossy because the message is being kept to be read
+                    // by a person, and one carrying bytes that are not
+                    // UTF-8 is a message worth seeing rather than one to
+                    // give up on twice.
+                    Error::Parse {
+                        source,
+                        json: String::from_utf8_lossy(&json).into_owned(),
+                    }
+                })
+            });
+
+        // Alpha and beta data arrives on the socket alongside the live
+        // galaxy, and is written into a spool like anything else. Which
+        // of the two a reader wanted is `galaxy`'s to say, and the rest
+        // is dropped here rather than handed over, so it cannot be
+        // recorded by forgetting to ask. See [`Envelope::live`].
+        if let Ok(envelope) = &read {
+            if !galaxy.shows(envelope.live) {
+                debug!(schema = %envelope.schema_ref, "filtered by galaxy");
+                return None;
+            }
+        }
+
+        let received_at = self.received_at;
+        Some(read.map(|envelope| Reading { received_at, envelope }))
+    }
+}
+
+/// The gateway's socket: the live [`Feed`]
+///
+/// **`Network` rather than `Live`**, the live *galaxy* being a different
+/// thing entirely — see [`Galaxy::LIVE`], which this filters by and
+/// which a recorded feed filters by in exactly the same way.
+///
+/// It does not end. A socket error comes back as an [`Error`] and the
+/// connection is replaced, a connection that goes quiet past the stall
+/// window is replaced, and the next frame is waited for. The frames it
+/// takes off the socket are read into messages by
+/// [`Feed::reading`], which is the spool's road too.
+pub struct Network {
     ctx: Context,
     url: String,
     connection: Connection,
     reports: Reporter,
     /// Absent when the caller asked for no stall timeout at all.
     stall: Option<Stall>,
-
-    /// Which galaxy's data to hand over; the live one unless asked otherwise.
+    /// Which galaxy's data to hand over; the live one unless asked
+    /// otherwise.
     galaxy: Galaxy,
-
-    /// Whether the opening `subscribed` line has been logged yet. Logged on
-    /// the first `next`, when the galaxy the builder chose is final.
+    /// Whether the opening `subscribed` line has been logged yet. Logged
+    /// on the first read, when the galaxy the builder chose is final.
     started: bool,
 }
 
-impl EnvelopeIterator {
+impl Network {
+    /// Subscribe to EDDN's ZMQ socket, reading every message on it
+    ///
+    /// `stall_timeout` is how long the gateway may publish nothing before
+    /// its connection is thrown away for a new one; `None` leaves the
+    /// connection alone however long it carries nothing, giving up the
+    /// only cover there is for the third case below and watching for the
+    /// other two as ever.
+    ///
+    /// # Connection resilience
+    ///
+    /// A subscription outlives the connection carrying it. There are three ways
+    /// one stops working, a different thing notices each, and all three are
+    /// reported through [`tracing`] as they happen.
+    ///
+    /// ## A connection that closes
+    ///
+    /// The gateway restarts, or something between here and it drops the
+    /// connection and says so. The socket sees the close, throws the connection
+    /// away and builds another, retrying until one takes.
+    ///
+    /// How hard it tries is [`RECONNECT_MIN`] and [`RECONNECT_MAX`].
+    ///
+    /// ## A connection that dies without closing
+    ///
+    /// The machine suspends, or the gateway disappears without a word. Nothing
+    /// arrives, but nothing fails either: no close comes, and a socket that only
+    /// ever reads never writes anything that could fail. So it looks exactly
+    /// like a working connection that happens to be quiet, and a subscriber can
+    /// wait on it for as long as it runs.
+    ///
+    /// Heartbeats tell the two apart. A ping is a write, and a connection that
+    /// brings nothing back at all -- no answer to it, no data either -- runs out
+    /// of time and is closed, so the case above takes over from there.
+    ///
+    /// How long that takes is [`PING_INTERVAL`] and [`IDLE_TIMEOUT`].
+    ///
+    /// ## A gateway that stops publishing
+    ///
+    /// The connection is in good health and carries nothing. Pings are answered
+    /// down in the gateway's socket, which knows nothing about whether the
+    /// program above it is still publishing, so heartbeats report the connection
+    /// as fine and are right to. Only counting the silence finds this one, which
+    /// is what `stall_timeout` counts, in the gaps a receive leaves by coming
+    /// back empty every [`POLL_INTERVAL`].
+    ///
+    /// How long to give it is a question about the gateway rather than about
+    /// this crate, which is why there is no default. EDDN at a busy hour carried
+    /// 31 messages a second across ten minutes and never once went 0.85s without
+    /// one, so a couple of minutes there is quiet that cannot happen. Somewhere
+    /// thinner, it is ordinary.
+    pub fn open(url: &str, stall_timeout: Option<Duration>) -> Network {
+        let ctx = Context::new();
+        let connection = open_retrying(&ctx, url);
+
+        Network {
+            ctx,
+            url: url.to_string(),
+            connection,
+            reports: Reporter::default(),
+            stall: stall_timeout.map(Stall::new),
+            galaxy: Galaxy::LIVE,
+            started: false,
+        }
+    }
+
+    /// Choose which galaxy's data to hand over
+    ///
+    /// [`Galaxy::LIVE`] by default, so a subscriber records only the
+    /// live galaxy unless it asks for the rest.
+    pub fn galaxy(mut self, galaxy: Galaxy) -> Network {
+        self.galaxy = galaxy;
+        self
+    }
+
     /// Throw the connection away and take a new one
     ///
     /// For a connection in the picture of health that carries nothing.
@@ -485,75 +705,31 @@ impl EnvelopeIterator {
         }
         self.reports.replaced();
     }
+}
 
-    /// Choose which galaxy's data to hand over
+impl Feed for Network {
+    fn showing(&self) -> Galaxy {
+        self.galaxy
+    }
+
+    /// One frame off the socket, waiting for one as long as it takes.
     ///
-    /// [`Galaxy::LIVE`] by default, so a subscriber records only the live
-    /// galaxy unless it asks for the rest.
-    pub fn galaxy(mut self, galaxy: Galaxy) -> Self {
-        self.galaxy = galaxy;
-        self
-    }
-}
-
-/// What a frame off the socket amounts to, or nothing where it is not ours
-///
-/// Apart from the receive, and everything a message goes through between
-/// arriving and being handed over is here rather than there: it is
-/// decompressed, read, and then either kept or dropped for describing a
-/// galaxy that is not the live one. Which means all of it can be tried
-/// without a socket for it to arrive on, including the dropping -- and a
-/// frame silently going missing is exactly the sort of thing that otherwise
-/// only shows up as a gap in a database months later.
-///
-/// [`None`] is a frame deliberately let go. A frame that could not be read at
-/// all is `Some(Err(_))`, and the difference matters: alpha and beta data
-/// arriving is ordinary, and a message that will not decompress is not.
-fn read_frame(
-    compressed: &[u8],
-    galaxy: Galaxy,
-) -> Option<Result<Envelope, Error>> {
-    let read = inflate::decompress_to_vec_zlib(compressed)
-        .map_err(Error::Decompress)
-        .and_then(|json| {
-            serde_json::from_slice::<Envelope>(&json).map_err(|source| {
-                // Lossy because the message is being kept to be read by a
-                // person, and one carrying bytes that are not UTF-8 is a
-                // message worth seeing rather than one to give up on twice.
-                Error::Parse {
-                    source,
-                    json: String::from_utf8_lossy(&json).into_owned(),
-                }
-            })
-        });
-
-    // Alpha and beta data arrives on this socket alongside the live galaxy.
-    // Which of the two a subscriber wanted is `galaxy`'s to say; the rest is
-    // dropped here rather than handed over, so it cannot be recorded by
-    // forgetting to ask. See [`Envelope::live`].
-    if let Ok(envelope) = &read {
-        if !galaxy.shows(envelope.live) {
-            debug!(schema = %envelope.schema_ref, "filtered by galaxy");
-            return None;
-        }
-    }
-
-    Some(read)
-}
-
-impl Iterator for EnvelopeIterator {
-    type Item = Result<Envelope, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // "subscribed", not "connected": connecting is asynchronous, so this
-        // only says the socket is open and trying, and whether it took is
-        // reported when the socket knows. Said on the first poll rather than
-        // in `subscribe` so the galaxy the builder chose is part of it.
+    /// The connection's health is looked at before every receive, not
+    /// only when one comes back empty: a gateway sending steadily can
+    /// still have lost and rebuilt its connection, and a receive that
+    /// always has something waiting would never leave room to hear
+    /// about it.
+    fn frame(&mut self) -> Option<Result<Frame, Error>> {
+        // "subscribed", not "connected": connecting is asynchronous, so
+        // this only says the socket is open and trying, and whether it
+        // took is reported when the socket knows. Said on the first read
+        // rather than at the open, so the galaxy the builder chose is
+        // part of it.
         if !self.started {
             self.started = true;
             let stall = self.stall.as_ref().map_or_else(
                 || "off".to_owned(),
-                |s| format!("{}s", s.timeout().as_secs()),
+                |it| format!("{}s", it.timeout().as_secs()),
             );
             info!(
                 url = %self.url,
@@ -562,7 +738,6 @@ impl Iterator for EnvelopeIterator {
                 "subscribed"
             );
         }
-
         loop {
             // Before the receive, not only when one comes back empty. A
             // gateway sending steadily can still have lost and rebuilt its
@@ -592,11 +767,15 @@ impl Iterator for EnvelopeIterator {
                         }
                     };
 
-                    if let Some(read) = read_frame(frame, self.galaxy) {
-                        return Some(read);
-                    }
-
-                    // A `/test` message, which `read_frame` drops.
+                    // Copied out of the socket's buffer, which is the one
+                    // allocation this split costs: 3.4 KB a message at the
+                    // measured 18.6 a second, and it is what lets the frame
+                    // outlive the receive — a recorder holds it, and a
+                    // parser that fails still leaves it whole.
+                    return Some(Ok(Frame {
+                        received_at: Utc::now(),
+                        bytes: frame.to_vec(),
+                    }));
                 }
                 // Nothing arrived within the poll interval, which is the only
                 // chance there is to see how long the quiet has run.
@@ -618,6 +797,34 @@ impl Iterator for EnvelopeIterator {
         }
     }
 }
+
+impl Iterator for Network {
+    type Item = Result<Reading, Error>;
+
+    /// [`Feed::reading`], which is the spool's `next` as well.
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reading()
+    }
+}
+
+/// A feed's messages with the receipt time dropped
+///
+/// What [`subscribe`] hands back, kept for every caller written before
+/// there was a [`Feed`] to hand one: the same messages in the same
+/// order, as envelopes. Generic, so a spool can be read this way too —
+/// there is nothing about dropping a timestamp that is a socket's.
+pub struct Envelopes<F>(F);
+
+impl<F: Feed> Iterator for Envelopes<F> {
+    type Item = Result<Envelope, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.0.next()?.map(|reading| reading.envelope))
+    }
+}
+
+/// What [`subscribe`] has always answered: [`Envelopes`] over the socket.
+pub type EnvelopeIterator = Envelopes<Network>;
 
 /// Placing a message by the schema it was sent under
 ///
@@ -701,14 +908,6 @@ mod tests {
         assert_eq!(fss.star_system.as_deref(), Some("M52 Sector PF-T b18-0"));
     }
 
-    /// The schema names the payload, so a journal schema is a journal entry
-    #[test]
-    fn a_journal_message_is_a_journal_entry() {
-        let envelope = envelope("https://eddn.edcd.io/schemas/journal/1", JUMP);
-
-        assert!(matches!(envelope.message, Message::Journal(_)));
-    }
-
     /// The event's own time is read, typed or not, and absent where unwritten
     #[test]
     fn a_message_gives_up_its_event_time() {
@@ -788,43 +987,6 @@ mod tests {
         assert!(matches!(black_market.message, Message::BlackMarket(_)));
     }
 
-    /// Both live outfitting versions are read, though their payloads differ
-    #[test]
-    fn either_outfitting_version_is_read() {
-        for (version, modules) in [
-            ("2", r#"["Int_Engine_Size3_Class5_Fast"]"#),
-            (
-                "3",
-                r#"[{
-                    "id": 128064258,
-                    "Name": "Int_Engine_Size3_Class5_Fast",
-                    "BuyPrice": 5103953,
-                    "BuyMercCoinsPrice": 0
-                }]"#,
-            ),
-        ] {
-            let reference =
-                format!("https://eddn.edcd.io/schemas/outfitting/{}", version);
-            let message = format!(
-                r#"{{
-                    "timestamp": "2026-08-08T12:00:00Z",
-                    "systemName": "Sol",
-                    "stationName": "Abraham Lincoln",
-                    "marketId": 128016384,
-                    "modules": {}
-                }}"#,
-                modules,
-            );
-
-            let envelope = envelope(&reference, &message);
-            assert!(
-                matches!(envelope.message, Message::Outfitting(_)),
-                "outfitting/{} was not read",
-                version,
-            );
-        }
-    }
-
     /// Alpha and beta traffic is marked, not turned into something else
     ///
     /// It arrives on the same socket under the same schemas, separated only by
@@ -840,13 +1002,6 @@ mod tests {
 
         assert!(!envelope.live);
         assert!(matches!(envelope.message, Message::Journal(_)));
-    }
-
-    /// Everything else is the live galaxy
-    #[test]
-    fn an_ordinary_schema_is_live() {
-        assert!(envelope("https://eddn.edcd.io/schemas/journal/1", JUMP).live);
-        assert!(envelope("nonsense", JUMP).live);
     }
 
     /// A schema nothing reads is kept rather than dropped
@@ -871,33 +1026,6 @@ mod tests {
         );
     }
 
-    /// A payload that disagrees with its schema is an error, not a shrug
-    ///
-    /// This is the whole difference from guessing. The schema says what the
-    /// payload is, so a journal message whose event will not read is a
-    /// message that is wrong, not a message of some other kind.
-    #[test]
-    fn a_payload_that_will_not_read_is_reported() {
-        let json = r#"{
-            "$schemaRef": "https://eddn.edcd.io/schemas/journal/1",
-            "header": {
-                "gatewayTimestamp": "2026-08-08T12:00:00Z",
-                "softwareName": "E:D Market Connector",
-                "softwareVersion": "5.11.3",
-                "uploaderID": "abc123"
-            },
-            "message": {
-                "timestamp": "2026-08-08T12:00:00Z",
-                "event": "FSDJump",
-                "StarSystem": "Sol",
-                "StarPos": "nowhere",
-                "SystemAddress": 10477373803
-            }
-        }"#;
-
-        assert!(serde_json::from_str::<Envelope>(json).is_err());
-    }
-
     /// A reference that is not one EDDN sends places nothing, and is kept
     #[test]
     fn a_reference_that_makes_no_sense_is_unmodelled() {
@@ -908,6 +1036,10 @@ mod tests {
         assert!(matches!(envelope.message, Message::Unmodeled(_)));
         // Nothing to report, rather than a version invented for the occasion.
         assert_eq!(envelope.version, None);
+        // And read as the live galaxy: `/test` is the only thing that says
+        // otherwise, so a reference this does not understand is not quietly
+        // taken for somewhere else.
+        assert!(envelope.live);
     }
 
     /// The name, the version and the galaxy, off the end of the reference
@@ -962,24 +1094,15 @@ mod tests {
         assert!(matches!(old.message, Message::Outfitting(_)));
         assert!(matches!(new.message, Message::Outfitting(_)));
     }
-
-    /// A test schema is still a version of something
-    #[test]
-    fn a_test_schema_reports_its_version_too() {
-        let envelope =
-            envelope("https://eddn.edcd.io/schemas/journal/1/test", JUMP);
-
-        assert_eq!(envelope.version.as_deref(), Some("1"));
-        assert!(!envelope.live);
-    }
 }
 
 /// What comes off the socket, short of the socket itself
 ///
-/// [`read_frame`] is everything between a frame arriving and a subscriber
-/// being handed it, which is where the one decision lives that nothing else
-/// can see: a frame deliberately let go looks exactly like a frame that never
-/// arrived. These are what say the difference is on purpose.
+/// [`Frame::read`] is everything between a frame arriving and a
+/// subscriber being handed it, which is where the one decision lives
+/// that nothing else can see: a frame deliberately let go looks exactly
+/// like a frame that never arrived. These are what say the difference is
+/// on purpose.
 #[cfg(test)]
 mod frames {
     use super::tests::{envelope_json, frame, JUMP};
@@ -988,15 +1111,34 @@ mod frames {
     const JOURNAL: &str = "https://eddn.edcd.io/schemas/journal/1";
     const JOURNAL_TEST: &str = "https://eddn.edcd.io/schemas/journal/1/test";
 
-    /// Live data is handed over
+    /// A frame as it would come off the socket at `secs` past the epoch
+    fn arrived(schema_ref: &str, message: &str, secs: i64) -> Frame {
+        Frame {
+            received_at: DateTime::from_timestamp(secs, 0).expect("a moment"),
+            bytes: frame(schema_ref, message),
+        }
+    }
+
+    /// A zlib frame of `json`, whatever the json is
+    fn deflated(json: &[u8]) -> Frame {
+        Frame {
+            received_at: Utc::now(),
+            bytes: miniz_oxide::deflate::compress_to_vec_zlib(json, 6),
+        }
+    }
+
+    /// Live data is handed over, with the moment it arrived
     #[test]
     fn a_live_frame_is_handed_over() {
-        let read = read_frame(&frame(JOURNAL, JUMP), Galaxy::LIVE)
-            .expect("a live frame should be handed over");
+        let read = arrived(JOURNAL, JUMP, 1_700_000_000)
+            .read(Galaxy::LIVE)
+            .expect("a live frame should be handed over")
+            .expect("and should read");
 
-        let envelope = read.expect("and should read");
-        assert!(envelope.live);
-        assert!(matches!(envelope.message, Message::Journal(_)));
+        assert!(read.envelope.live);
+        assert!(matches!(read.envelope.message, Message::Journal(_)));
+        // The frame's own moment, not the moment it was read.
+        assert_eq!(read.received_at.timestamp(), 1_700_000_000);
     }
 
     /// And alpha and beta data is not
@@ -1005,47 +1147,45 @@ mod frames {
     /// was understood; this says something acts on it.
     #[test]
     fn a_test_frame_is_let_go() {
-        // Live: the test frame is dropped; All and Test keep it.
-        assert!(read_frame(&frame(JOURNAL_TEST, JUMP), Galaxy::LIVE).is_none());
-        let kept = read_frame(&frame(JOURNAL_TEST, JUMP), Galaxy::ALL)
+        let test = arrived(JOURNAL_TEST, JUMP, 0);
+        let live = arrived(JOURNAL, JUMP, 0);
+
+        // Live: the test frame is dropped; All keeps it.
+        assert!(test.read(Galaxy::LIVE).is_none());
+        let kept = test
+            .read(Galaxy::ALL)
             .expect("a test frame should be kept under All")
             .expect("and should read");
-        assert!(!kept.live);
+        assert!(!kept.envelope.live);
         // And Test drops the live galaxy.
-        assert!(read_frame(&frame(JOURNAL, JUMP), Galaxy::TEST).is_none());
+        assert!(live.read(Galaxy::TEST).is_none());
     }
 
-    /// A frame that is not zlib is reported rather than let go
+    /// A frame that will not read is reported rather than let go
     ///
-    /// The difference the return type is for. Beta data arriving is ordinary
-    /// and worth nothing but silence; a frame that will not decompress is the
-    /// gateway or this crate being wrong, and going quiet about it would
-    /// leave nothing to notice.
+    /// The difference the return type is for. Beta data arriving is
+    /// ordinary and worth nothing but silence; a frame that will not read
+    /// is the gateway or this crate being wrong, and going quiet about it
+    /// would leave nothing to notice. Three ways one fails, and all three
+    /// are `Some(Err(_))`:
     #[test]
-    fn a_frame_that_is_not_zlib_is_reported() {
+    fn a_frame_that_will_not_read_is_reported() {
+        // Not zlib at all.
         assert!(matches!(
-            read_frame(b"not zlib at all", Galaxy::LIVE),
+            Frame { received_at: Utc::now(), bytes: b"not zlib".to_vec() }
+                .read(Galaxy::LIVE),
             Some(Err(Error::Decompress(_))),
         ));
-    }
 
-    /// So is one that decompresses into something that is not an envelope
-    #[test]
-    fn a_frame_that_is_not_an_envelope_is_reported() {
-        let rubbish = miniz_oxide::deflate::compress_to_vec_zlib(b"{}", 6);
-
+        // Zlib, but not an envelope.
         assert!(matches!(
-            read_frame(&rubbish, Galaxy::LIVE),
-            Some(Err(Error::Parse { .. }))
+            deflated(b"{}").read(Galaxy::LIVE),
+            Some(Err(Error::Parse { .. })),
         ));
-    }
 
-    /// And one whose payload disagrees with its schema
-    ///
-    /// Which the schema settles: a journal message that will not read, not a
-    /// message of some other kind.
-    #[test]
-    fn a_frame_whose_payload_will_not_read_is_reported() {
+        // An envelope whose payload disagrees with the schema it was sent
+        // under — which the schema settles: a journal message that will
+        // not read, not a message of some other kind.
         let json = envelope_json(
             JOURNAL,
             r#"{
@@ -1056,12 +1196,9 @@ mod frames {
                 "SystemAddress": 10477373803
             }"#,
         );
-        let bad =
-            miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 6);
-
         assert!(matches!(
-            read_frame(&bad, Galaxy::LIVE),
-            Some(Err(Error::Parse { .. }))
+            deflated(json.as_bytes()).read(Galaxy::LIVE),
+            Some(Err(Error::Parse { .. })),
         ));
     }
 
@@ -1086,10 +1223,8 @@ mod frames {
                 "Progress": 1.0
             }"#,
         );
-        let bad =
-            miniz_oxide::deflate::compress_to_vec_zlib(json.as_bytes(), 6);
-
-        let Some(Err(err)) = read_frame(&bad, Galaxy::LIVE) else {
+        let Some(Err(err)) = deflated(json.as_bytes()).read(Galaxy::LIVE)
+        else {
             panic!("a payload that will not read should be reported")
         };
         let said = err.to_string();
@@ -1105,16 +1240,144 @@ mod frames {
     /// Here there is text and an offset into it, so the window is the answer.
     #[test]
     fn a_malformed_envelope_shows_where_it_stopped() {
-        let truncated = miniz_oxide::deflate::compress_to_vec_zlib(
-            br#"{"$schemaRef": "https://eddn.edcd.io/schemas/journal/1", "heade"#,
-            6,
-        );
+        let truncated = br#"{"$schemaRef": "https://eddn.edcd.io/schemas/journal/1", "heade"#;
 
-        let Some(Err(err)) = read_frame(&truncated, Galaxy::LIVE) else {
+        let Some(Err(err)) = deflated(truncated).read(Galaxy::LIVE) else {
             panic!("a malformed envelope should be reported")
         };
 
         let near = err.near().expect("should point at where it stopped");
         assert!(near.contains("heade"), "pointed elsewhere: {}", near);
+    }
+}
+
+/// The seam a spool, and an offline test, hang off
+#[cfg(test)]
+mod feeds {
+    use super::tests::{frame, JUMP};
+    use super::*;
+
+    const JOURNAL: &str = "https://eddn.edcd.io/schemas/journal/1";
+
+    /// Frames a test wrote, read by the same thing that reads a socket's.
+    ///
+    /// **What a third feed costs is this struct**: hand over frames, say
+    /// which galaxy, and the reading is [`Feed::reading`]'s. Nothing
+    /// here decompresses, parses or filters, which is why a fixture
+    /// cannot drift from the wire.
+    struct Recorded(std::vec::IntoIter<Frame>);
+
+    impl Iterator for Recorded {
+        type Item = Result<Reading, Error>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.reading()
+        }
+    }
+
+    impl Feed for Recorded {
+        fn frame(&mut self) -> Option<Result<Frame, Error>> {
+            self.0.next().map(Ok)
+        }
+
+        fn showing(&self) -> Galaxy {
+            Galaxy::LIVE
+        }
+    }
+
+    fn recorded(frames: Vec<Frame>) -> Recorded {
+        Recorded(frames.into_iter())
+    }
+
+    /// A third feed is a struct and two methods, held behind `dyn Feed`
+    ///
+    /// **What the trait is for**, and the two properties an added
+    /// generic method or a non-`Send` field would quietly take away: a
+    /// consumer holds `Box<dyn Feed>`, hands it to the thread it parks
+    /// on, and never learns what is behind it. That is what lets a
+    /// recorded hour stand in for the wire — the one path with no
+    /// offline exercise otherwise — and what makes `--from spool=DIR` a
+    /// constructor rather than a second sink.
+    ///
+    /// What those readings *say* is
+    /// [`a_spool_and_a_subscription_read_alike`]'s business, and
+    /// [`Frame::read`]'s tests before it.
+    #[test]
+    fn a_feed_of_anything_is_held_behind_dyn_feed() {
+        let frames = vec![Frame {
+            received_at: Utc::now(),
+            bytes: frame(JOURNAL, JUMP),
+        }];
+        let feed: Box<dyn Feed> = Box::new(recorded(frames));
+        assert_eq!(feed.resume(), None, "a feed with no position said one");
+
+        // `Send`, which a trait object that is not cannot be, and which
+        // the whole arrangement rests on: the feed is read on a thread of
+        // its own because reading it parks one.
+        let counted = std::thread::spawn(move || feed.count());
+        assert_eq!(counted.join().expect("the thread"), 1);
+    }
+
+    /// A spool and a subscription answer the same bytes the same way
+    ///
+    /// **The divergence this crate is shaped to make impossible.** Two
+    /// feeds, one read off a socket and one off a disk, are two things
+    /// that could drift: a galaxy filter fixed in one, a receipt time
+    /// stamped differently in the other, and a directory built from a
+    /// spool stops matching one built from the wire. So there is one
+    /// [`Feed::reading`] and the feeds differ only in where their frames
+    /// come
+    /// from — this drives the same frames down both and asks for the
+    /// same answer.
+    #[test]
+    fn a_spool_and_a_subscription_read_alike() {
+        let at = |secs: i64| {
+            DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("a moment")
+        };
+        let test = "https://eddn.edcd.io/schemas/journal/1/test";
+        let frames: Vec<Frame> = [JOURNAL, test, JOURNAL]
+            .iter()
+            .enumerate()
+            .map(|(n, schema)| Frame {
+                received_at: at(n as i64),
+                bytes: frame(schema, JUMP),
+            })
+            .collect();
+
+        // Down the wire's road: frames in, readings out.
+        let wire: Vec<Reading> =
+            recorded(frames.clone()).map(|it| it.expect("a reading")).collect();
+
+        // And down the spool's: the same frames written to a segment and
+        // read back through `spool`.
+        let dir = std::env::temp_dir()
+            .join(format!("eddn-alike-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut recorder = spool::Recorder::open(&dir).expect("a recorder");
+        for frame in &frames {
+            recorder.write(frame).expect("a write");
+        }
+        let spooled: Vec<Reading> = spool::Spool::open(
+            &dir,
+            spool::Start::Earliest,
+            spool::Replay::ToEnd,
+        )
+        .expect("a spool")
+        .map(|it| it.expect("a reading"))
+        .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let said = |read: &[Reading]| {
+            read.iter()
+                .map(|it| (it.received_at, it.envelope.schema_ref.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(said(&wire), said(&spooled));
+        // Both let the test-galaxy frame go, and neither restamped what
+        // it kept.
+        assert_eq!(
+            said(&wire),
+            vec![(at(0), JOURNAL.to_owned()), (at(2), JOURNAL.to_owned()),]
+        );
     }
 }

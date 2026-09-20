@@ -6,19 +6,27 @@ authors = ["Nathan Lilienthal <nathan@nixpulvis.com>"]
 license = "Beerware"
 edition = "2021"
 
+# The recorder, and whatever reading verbs come to sit beside it. One
+# binary named for the crate, with the verb saying what it does — the way
+# `galos-db` and `galos-index` read.
+[[bin]]
+name = "eddn"
+path = "src/bin/eddn.rs"
+required-features = ["cli"]
+
 [[bin]]
 name = "eddn_gui"
 path = "src/gui/main.rs"
 required-features = ["gui"]
 
 [features]
+cli = ["dep:clap", "dep:tracing-subscriber"]
 gui = [
+    "cli",
     "dep:eframe",
     "dep:egui",
     "dep:egui_extras",
     "dep:parking_lot",
-    "dep:clap",
-    "dep:tracing-subscriber",
     "dep:regex",
 ]
 

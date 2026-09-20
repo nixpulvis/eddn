@@ -106,9 +106,9 @@ impl Cadence {
         while self.arrivals.front().is_some_and(|at| *at < cutoff) {
             self.arrivals.pop_front();
         }
-        let due = self.last_sample.map_or(true, |at| {
-            now.duration_since(at) >= Duration::from_secs(1)
-        });
+        let due = self
+            .last_sample
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1));
         if due {
             self.last_sample = Some(now);
             self.samples.push_back((self.rate() as f32, self.stalled()));

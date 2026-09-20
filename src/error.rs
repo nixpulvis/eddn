@@ -23,6 +23,10 @@ pub enum Error {
     Socket(omq_tokio::Error),
     /// A message arrived that is not the zlib EDDN sends.
     Decompress(TINFLStatus),
+    /// A spool would not be read, or holds something that is not a
+    /// record. Not a torn tail, which is "not yet" rather than a failure
+    /// — see [`crate::spool`].
+    Spool { path: std::path::PathBuf, source: std::io::Error },
     /// A message arrived that decompressed but is not an
     /// [`Envelope`](crate::Envelope).
     Parse {
@@ -98,6 +102,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Error::Socket(err) => write!(f, "socket: {}", err),
+            Error::Spool { path, source } => {
+                write!(f, "spool {}: {}", path.display(), source)
+            }
             Error::Decompress(status) => {
                 write!(f, "decompress: {:?}", status)
             }
@@ -128,6 +135,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Socket(err) => Some(err),
+            Error::Spool { source, .. } => Some(source),
             Error::Decompress(_) => None,
             Error::Parse { source, .. } => Some(source),
         }

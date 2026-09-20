@@ -4,7 +4,7 @@
 //! runs here instead, on its own thread, handing each envelope across a channel
 //! and waking the UI to come and take it.
 
-use eddn::{subscribe, Envelope, Galaxy};
+use eddn::{Envelope, Feed, Galaxy, Network};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
@@ -34,7 +34,8 @@ pub fn spawn(
         .name("eddn-subscribe".to_owned())
         .spawn(move || {
             let galaxy = if include_test { Galaxy::ALL } else { Galaxy::LIVE };
-            for result in subscribe(&url, stall).galaxy(galaxy) {
+            let feed = Network::open(&url, stall).galaxy(galaxy).envelopes();
+            for result in feed {
                 match result {
                     Ok(envelope) => {
                         if tx.send(Box::new(envelope)).is_err() {
