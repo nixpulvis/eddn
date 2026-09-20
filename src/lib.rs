@@ -207,8 +207,8 @@ pub struct Header {
 /// **The journal variant is not boxed**, though it is most of the enum's
 /// 720 bytes and the rest are a fraction of that. Measured against what
 /// the feed does with them: 18.6 messages a second is 17 KB/s of moves,
-/// and the deepest a message is ever held is `galos-sync`'s 10,000-deep
-/// channel — 9.4 MB of `Envelope` against 4 MB boxed. Neither number is
+/// and the deepest a message is ever held is the 10,000-deep channel an
+/// ingest drains — 9.4 MB of `Envelope` against 4 MB boxed. Neither number is
 /// worth a `Box` in the pattern every consumer of this crate writes.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
