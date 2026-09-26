@@ -7,8 +7,7 @@
 //! **Optional, and off by default.** Two tools each subscribing costs 17.5
 //! KiB/s of somebody else's infrastructure apiece and works with nothing
 //! installed; this is for an operator who would rather be one subscriber,
-//! or who wants replay after a crash. What it buys and what it costs is
-//! `doc/PLAN-EDDN-SPOOL.md`, measured.
+//! or who wants replay after a crash.
 //!
 //! A verb rather than a binary a verb: the crate is `eddn`, so the command
 //! is `eddn`, and there is room beside `record` for the reading verbs

@@ -21,8 +21,7 @@
 //!
 //! A consumer holds `Box<dyn Feed>` and never learns which it has — the
 //! source of messages is a constructor argument, not a shape the sinks
-//! and the shutdown path are written twice for. See
-//! `doc/PLAN-EDDN-SPOOL.md`.
+//! and the shutdown path are written twice for.
 //!
 //! [`subscribe`] is `Network::open(…).envelopes()` under the name every
 //! caller written before the trait still uses: the same messages, as
